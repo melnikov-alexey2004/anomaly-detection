@@ -97,7 +97,7 @@ class Config:
     # ---------- LoRA ----------
     lora_r: int = 8
     lora_alpha: int = 16
-    lora_dropout: float = 0.1
+    lora_dropout: float = 0.15
     lora_target_modules: typing.List[str] = dataclasses.field(
         default_factory=lambda: ["query", "key", "value", "dense"]
     )
@@ -105,7 +105,7 @@ class Config:
     # ---------- обучение ----------
     num_epochs: int = 3
     learning_rate: float = 5e-5
-    weight_decay: float = 0.01
+    weight_decay: float = 0.05
     warmup_steps: int = 200
     scheduler_type: str = "linear"             # linear | cosine
     grad_clip: float = 1.0

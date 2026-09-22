@@ -166,25 +166,25 @@ import typing
 import math
 import regex as re
 
-patterns = [r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(:\d{1,5})?',  # IP:PORT
-            r'([0-9A-Fa-f]{2}:){11}[0-9A-Fa-f]{2}',  # Special MAC
-            r'([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}',  # MAC
-            r'[a-zA-Z0-9]*[:\.]*([/\\]+[^/\\\s\[\]]+)+[/\\]*',  # file path
-            r'\b[0-9a-fA-F]{8}\b',
-            r'\b[0-9a-fA-F]{10}\b',
-            r'(\w+[\w\.]*)@(\w+[\w\.]*)\-(\w+[\w\.]*)',
-            r'(\w+[\w\.]*)@(\w+[\w\.]*)',
-            r'[a-zA-Z\.\:\-\_]*\d[a-zA-Z0-9\.\:\-\_]*',  # word
-            ]
-combined_pattern_str = '|'.join(patterns)
 
-combined_pattern = re.compile(combined_pattern_str)
-dots = re.compile(r'\.{3,}')
+# 1) camelCase / PascalCase → snake_case
+#    SystemCall → System_Call
+_camel_1 = re.compile(r'([a-z0-9])([A-Z])')       # aB → a_B
+_camel_2 = re.compile(r'([A-Z]+)([A-Z][a-z])')    # ABCd → AB_Cd
 
-def replace_patterns(text):
-    text = dots.sub("..", text)
-    text = combined_pattern.sub(" ", text)
-    return text
+# 2) всё, кроме букв  → пробел
+_non_alpha = re.compile(r'[^a-zA-Z]+')
+
+# 3) множественные пробелы → один
+_spaces = re.compile(r'\s+')
+
+def normalize_text(s: str) -> str:
+    s = _camel_1.sub(r'\1_\2', s)
+    s = _camel_2.sub(r'\1_\2', s)
+    s = s.lower()
+    s = _non_alpha.sub(' ', s)   # цифры, [, ], (, ), ., :, /, \, -, _ → пробел
+    s = _spaces.sub(' ', s).strip()
+    return s
 
 import io
 
@@ -279,7 +279,7 @@ class SuperComputerDataset(Dataset):
                 break
             raw_log = raw.decode("latin-1", errors="replace")
             dt, cnt, label = self.source.get_time_content_label(raw_log)
-            cnt = replace_patterns(cnt).strip()
+            cnt = normalize_text(cnt).strip()
             window_times.append(dt)
             window.append(cnt)
             window_raws.append(raw_log)
