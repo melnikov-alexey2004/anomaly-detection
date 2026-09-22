@@ -167,6 +167,19 @@ import math
 import regex as re
 
 
+# сущности
+_patterns = [
+    r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(:\d{1,5})?',      # IP:PORT
+    r'([0-9A-Fa-f]{2}:){11}[0-9A-Fa-f]{2}',                # MAC-12
+    r'([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}',                 # MAC-6
+    r'[a-zA-Z0-9]*[:\.]*([/\\]+[^/\\\s\[\]]+)+[/\\]*',     # path
+    r'\b[0-9a-fA-F]{8}\b',                                 # hex-8
+    r'\b[0-9a-fA-F]{10}\b',                                # hex-10
+    r'(\w+[\w\.]*)@(\w+[\w\.]*)\-(\w+[\w\.]*)',            # email-1
+    r'(\w+[\w\.]*)@(\w+[\w\.]*)',                          # email-2
+]
+_entity_pat = re.compile('|'.join(_patterns))
+
 # 1) camelCase / PascalCase → snake_case
 #    SystemCall → System_Call
 _camel_1 = re.compile(r'([a-z0-9])([A-Z])')       # aB → a_B
@@ -177,11 +190,15 @@ _non_alpha = re.compile(r'[^a-zA-Z]+')
 
 # 3) множественные пробелы → один
 _spaces = re.compile(r'\s+')
+_digits = re.compile(r'\d+')
 
 def normalize_text(s: str) -> str:
+    # 1) вырезаем сущности (IP, MAC, пути, hex, email) → пробел
+    s = _entity_pat.sub(' ', s)
+
     s = _camel_1.sub(r'\1_\2', s)
     s = _camel_2.sub(r'\1_\2', s)
-    s = s.lower()
+    s = _spaces.sub(r' num ', s)
     s = _non_alpha.sub(' ', s)   # цифры, [, ], (, ), ., :, /, \, -, _ → пробел
     s = _spaces.sub(' ', s).strip()
     return s
