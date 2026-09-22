@@ -104,7 +104,7 @@ class Config:
 
     # ---------- обучение ----------
     num_epochs: int = 3
-    learning_rate: float = 1e-4
+    learning_rate: float = 5e-5
     weight_decay: float = 0.01
     warmup_steps: int = 200
     scheduler_type: str = "linear"             # linear | cosine
