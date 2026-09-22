@@ -269,7 +269,7 @@ def train_loop(model, optimizer, scheduler, train_loader,
             optimizer.zero_grad()
             with autocast_ctx:
                 logits = model(log_embs, batch["times"], mask)
-            lloss = criterion(logits.float(), y)
+            loss = criterion(logits.float(), y)
 
             # защита от NaN/Inf loss
             if torch.isnan(loss) or torch.isinf(loss):
@@ -722,7 +722,12 @@ def continue_training(state: dict, cfg: Config) -> dict:
     ds = state["dataset"]
     val_ds = state["val_dataset"]
     eval_start_line = state["eval_start_line"]
-    repo_id = cfg.hub_repo_id if cfg.push_to_hub else None
+    # используем ту же логику, что и в run(): resolve_repo_id обрабатывает
+    # случай hub_repo_id=None через whoami()
+    if cfg.push_to_hub:
+        repo_id = cfg.hub_repo_id or state.get("repo_id") or resolve_repo_id(cfg)
+    else:
+        repo_id = None
 
     # --- train_loader ---
     if cfg.train_ratio != state.get("train_ratio") \
