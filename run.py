@@ -31,7 +31,7 @@ from dataset import (
 from model import (
     load_jasper_encoder, LineEmbeddingCache, make_collate_fn,
     LogAnomalyModel, autocast_context, evaluate,
-    save_trainable, load_trainable, load_adapter_into,
+    save_trainable, load_adapter_into,
     resolve_dtype,
 )
 
@@ -66,7 +66,7 @@ class Config:
     time_emb_len: int = 16
     use_time2vec: bool = True
     use_cyclic_time: bool = True
-    use_time_present: bool = True       # ← флаг has_time
+    use_time_present: bool = True
 
     # ---------- Jasper ----------
     jasper_model_name: str = "infgrad/Jasper-Token-Compression-600M"
@@ -77,11 +77,12 @@ class Config:
     # ---------- Longformer ----------
     longformer_model_name: str = "allenai/longformer-base-4096"
     longformer_layers: int = 12
-    longformer_attention_window: int = 100   # win_size + 1 % longformer_attention_window == 0должно быть кратно
+    # (win_size + 1) % attention_window == 0  →  паддинга нет
+    longformer_attention_window: int = 100
 
     # ---------- агрегация ----------
     aggregate_layers: int = 4
-    aggregate_mode: str = "weighted"
+    aggregate_mode: str = "weighted"           # weighted | mean | attn_pool | last
     use_learned_cls: bool = True
 
     # ---------- квантизация ----------
@@ -90,7 +91,7 @@ class Config:
     bnb_quant_type: str = "nf4"
     bnb_double_quant: bool = True
     bnb_compute_dtype: str = "bfloat16"
-    mixed_dtype: str = "bfloat16"
+    mixed_dtype: str = "bfloat16"              # bfloat16 | float16 | float32
     use_autocast: bool = False
 
     # ---------- LoRA ----------
@@ -106,7 +107,7 @@ class Config:
     learning_rate: float = 1e-4
     weight_decay: float = 0.01
     warmup_steps: int = 200
-    scheduler_type: str = "linear"
+    scheduler_type: str = "linear"             # linear | cosine
     grad_clip: float = 1.0
     seed: int = 42
 
@@ -392,7 +393,7 @@ def _build_train_loader(ds, eval_start_line, cfg, line_cache):
         ds, target_ratio=cfg.target_ratio, seed=cfg.seed,
     )
     # не даём окну залезть в eval-зону
-    safe_max = min(train_limit, eval_start_line - cfg.win_size)
+    safe_max = max(0, min(train_limit, eval_start_line - cfg.win_size))
     train_sampler = FilteredSampler(base_sampler, max_start=safe_max)
     collate = make_collate_fn(line_cache)
     train_loader = DataLoader(
@@ -419,6 +420,7 @@ def _build_scheduler(optimizer, total_steps, cfg):
 
 
 def _build_model(cfg, jasper_dim, device):
+    """Три ветки dtype: quant / autocast / обычная."""
     model = LogAnomalyModel(cfg, jasper_dim, device)
     if cfg.use_quantization:
         # longformer уже на device через device_map; головы надо явно перенести
@@ -430,6 +432,7 @@ def _build_model(cfg, jasper_dim, device):
         if model.use_cls:
             model.cls_emb = torch.nn.Parameter(model.cls_emb.data.to(device))
     elif cfg.use_autocast:
+        # fp32 master-веса + autocast(bf16/fp16)
         model = model.to(device).float()
     else:
         model = model.to(device).to(resolve_dtype(cfg))
@@ -510,16 +513,12 @@ def run(cfg: Config):
     print(f"[opt] trainable={n_train:,} / total={n_total:,} "
           f"({n_train / max(n_total, 1) * 100:.2f}%)")
 
-    # --- optimizer + scheduler ДО resume ---
-    optimizer = torch.optim.AdamW(
-        [p for p in model.parameters() if p.requires_grad],
-        lr=cfg.learning_rate, weight_decay=cfg.weight_decay,
-    )
-    total_steps = max(1, len(train_loader) * cfg.num_epochs)
-    scheduler = _build_scheduler(optimizer, total_steps, cfg)
-
-    # --- resume ---
+    # ============================================================
+    # RESUME (сначала — привести модель к финальному состоянию)
+    # ============================================================
     start_epoch, global_step = 0, 0
+    ckpt_state = None
+
     if cfg.resume_from_repo and cfg.resume_from_run_tag:
         resume_path_in_repo = f"runs/{cfg.resume_from_run_tag}"
         local_ckpt = "/content/ckpt_resume"
@@ -535,11 +534,44 @@ def run(cfg: Config):
         assert os.path.isfile(os.path.join(train_state_dir, "train_state.pt")), \
             f"нет train_state.pt в {train_state_dir}"
 
+        # 1) LoRA-веса
         load_adapter_into(model, adapter_dir)
-        start_epoch, global_step = load_trainable(
-            model, optimizer, scheduler, train_state_dir, device
+
+        # 2) головы + epoch/step + optimizer/scheduler state
+        ckpt_state = torch.load(
+            os.path.join(train_state_dir, "train_state.pt"),
+            map_location="cpu",
         )
+        model.load_head_state_dict(ckpt_state["head_state"])
+        start_epoch = ckpt_state.get("epoch", 0)
+        global_step = ckpt_state.get("global_step", 0)
         print(f"[resume] start_epoch={start_epoch} step={global_step}")
+
+    # ============================================================
+    # OPTIMIZER + SCHEDULER (после resume — модель окончательная)
+    # ============================================================
+    optimizer = torch.optim.AdamW(
+        [p for p in model.parameters() if p.requires_grad],
+        lr=cfg.learning_rate, weight_decay=cfg.weight_decay,
+    )
+    total_steps = max(1, len(train_loader) * cfg.num_epochs)
+    scheduler = _build_scheduler(optimizer, total_steps, cfg)
+
+    if ckpt_state is not None:
+        # optimizer.state_dict() от total_steps не зависит — грузим всегда
+        try:
+            optimizer.load_state_dict(ckpt_state["optimizer"])
+            print("[resume] optimizer state восстановлен")
+        except Exception as e:
+            print(f"[resume] optimizer не восстановился: {e}")
+
+        # scheduler.state_dict() зависит от total_steps — может не совпасть
+        try:
+            scheduler.load_state_dict(ckpt_state["scheduler"])
+            print("[resume] scheduler state восстановлен")
+        except Exception as e:
+            print(f"[resume] scheduler не восстановился "
+                  f"(изменены num_epochs / train_ratio?): {e}")
 
     # --- loss + autocast ---
     criterion = torch.nn.BCEWithLogitsLoss()
@@ -639,9 +671,16 @@ def run(cfg: Config):
 def continue_training(state: dict, cfg: Config) -> dict:
     """
     Продолжает обучение на тех же объектах (модель, оптимизатор, история).
-    Пересобирает train_loader, если cfg.train_ratio изменился.
-    Возвращает обновлённый state.
+    Пересобирает train_loader, если cfg.train_ratio или batch_size изменились.
+
+    Внимание: при продолжении scheduler создаётся заново, поэтому warmup
+    снова начнётся с нуля. Рекомендуется ставить warmup_steps=0 в новом cfg.
     """
+    if cfg.warmup_steps > 0:
+        print(f"[continue] warn: warmup_steps={cfg.warmup_steps} > 0. "
+              f"LR снова пройдёт прогрев. Рекомендуется warmup_steps=0 "
+              f"для дообучения.")
+
     model = state["model"]
     optimizer = state["optimizer"]
     criterion = state["criterion"]

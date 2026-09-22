@@ -207,8 +207,9 @@ def make_collate_fn(cache: LineEmbeddingCache):
 
 class LogProjector(nn.Module):
     """
-    LayerNorm → Linear → GELU → Linear, последний Linear — zero-init,
-    residual через отдельный Linear при разных размерностях.
+    LayerNorm → Linear → GELU → Linear, последний Linear — zero-init.
+    При in_dim == out_dim добавляется residual (identity-старт).
+    При разных размерностях residual = Linear(in→out) без bias.
     """
     def __init__(self, in_dim: int, out_dim: int, hidden_mult: int = 2):
         super().__init__()
@@ -384,7 +385,6 @@ class LogAnomalyModel(nn.Module):
                 )
             own[name].data.copy_(tensor.to(own[name].device, dtype=own[name].dtype))
 
-
     def forward(self, log_embs, times, attention_mask):
         target_dtype = next(self.projector.parameters()).dtype
         log_embs = log_embs.to(target_dtype)
@@ -399,7 +399,7 @@ class LogAnomalyModel(nn.Module):
                               device=x.device)
             attention_mask = torch.cat([ones, attention_mask], dim=1)
 
-        original_len = attention_mask.shape[1]  # до вызова longformer
+        original_len = attention_mask.shape[1]                    # до longformer
 
         lf_out = self.longformer(
             inputs_embeds=x,
@@ -414,7 +414,7 @@ class LogAnomalyModel(nn.Module):
         K = self.aggregator.k
 
         if self.use_cls:
-            hs = torch.stack([h[:, 0] for h in hidden[-K:]], dim=0)  # [K,B,H]
+            hs = torch.stack([h[:, 0] for h in hidden[-K:]], dim=0)   # [K,B,H]
             if self.aggregator.mode == "weighted":
                 w = torch.softmax(self.aggregator.layer_weights, dim=0)
                 pooled = (hs * w.view(-1, 1, 1)).sum(dim=0)
@@ -473,7 +473,9 @@ def autocast_context(cfg):
 
 @torch.no_grad()
 def evaluate(model, loader, device, criterion, autocast_ctx=None,
-             max_windows: typing.Optional[int] = None, max_batches=None, desc="eval") -> dict:
+             max_windows: typing.Optional[int] = None,
+             max_batches: typing.Optional[int] = None,
+             desc: str = "eval") -> dict:
     model.eval()
     losses, probs, ys = [], [], []
     n_seen = 0
@@ -539,14 +541,13 @@ def save_trainable(model, optimizer, scheduler, epoch, global_step, save_dir):
 
 
 def load_adapter_into(model, adapter_dir: str):
-    from peft import PeftModel
+    """Загружает LoRA-адаптер по локальному пути (in-place, без пересоздания PeftModel)."""
     if isinstance(model.longformer, PeftModel):
-        # уже PeftModel — просто грузим поверх
         try:
             model.longformer.load_adapter(adapter_dir, adapter_name="default")
             model.longformer.set_adapter("default")
-        except Exception:
-            # fallback: пересоздаём
+        except Exception as e:
+            print(f"[load_adapter] load_adapter упал ({e}); fallback через PeftModel")
             model.longformer = PeftModel.from_pretrained(
                 model.longformer.base_model, adapter_dir, is_trainable=True
             )
@@ -558,13 +559,6 @@ def load_adapter_into(model, adapter_dir: str):
         if "lora_" in n:
             p.requires_grad_(True)
 
-def load_trainable(model, optimizer, scheduler, load_dir, device):
-    ckpt = torch.load(os.path.join(load_dir, "train_state.pt"),
-                      map_location="cpu")
-    model.load_head_state_dict(ckpt["head_state"])
-    try:
-        optimizer.load_state_dict(ckpt["optimizer"])
-        scheduler.load_state_dict(ckpt["scheduler"])
-    except Exception as e:
-        print(f"[resume] не удалось восстановить optimizer/scheduler: {e}")
-    return ckpt.get("epoch", 0), ckpt.get("global_step", 0)
+
+# load_trainable удалён: resume-логика целиком реализована в run.py,
+# чтобы optimizer/scheduler создавались ПОСЛЕ load_adapter_into.
