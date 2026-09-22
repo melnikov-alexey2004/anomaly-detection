@@ -198,7 +198,7 @@ def normalize_text(s: str) -> str:
 
     s = _camel_1.sub(r'\1_\2', s)
     s = _camel_2.sub(r'\1_\2', s)
-    s = _digits.sub(r' num ', s)
+    # s = _digits.sub(r' num ', s)
     s = _non_alpha.sub(' ', s)   # цифры, [, ], (, ), ., :, /, \, -, _ → пробел
     s = _spaces.sub(' ', s).strip()
     return s
