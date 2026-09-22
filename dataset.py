@@ -182,8 +182,8 @@ combined_pattern = re.compile(combined_pattern_str)
 dots = re.compile(r'\.{3,}')
 
 def replace_patterns(text):
-    text = dots.sub(text, "..")
-    text = combined_pattern.sub(text, "<*>")
+    text = dots.sub("..", text)
+    text = combined_pattern.sub(" ", text)
     return text
 
 import io
@@ -279,7 +279,7 @@ class SuperComputerDataset(Dataset):
                 break
             raw_log = raw.decode("latin-1", errors="replace")
             dt, cnt, label = self.source.get_time_content_label(raw_log)
-            cnt = replace_patterns(cnt)
+            cnt = replace_patterns(cnt).strip()
             window_times.append(dt)
             window.append(cnt)
             window_raws.append(raw_log)
