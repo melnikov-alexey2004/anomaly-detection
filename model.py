@@ -343,9 +343,11 @@ class LogAnomalyModel(nn.Module):
         if self.use_cls:
             self.cls_emb = nn.Parameter(torch.randn(1, 1, lf_hidden) * 0.02)
 
-        time_dim   = (cfg.time_emb_len + 1) if cfg.use_time2vec else 0
+        time_dim = (cfg.time_emb_len + 1) if cfg.use_time2vec else 0
         cyclic_dim = 10 if cfg.use_cyclic_time else 0
-        head_dim   = lf_hidden + time_dim + cyclic_dim + 1
+        has_time_dim = 1 if getattr(cfg, "use_time_present", False) else 0
+        head_dim = lf_hidden + time_dim + cyclic_dim + 1 + has_time_dim
+
         self.classifier = nn.Sequential(
             nn.Linear(head_dim, 256),
             nn.ReLU(),
@@ -376,6 +378,8 @@ class LogAnomalyModel(nn.Module):
                                                 dtype=own[name].dtype))
 
     def forward(self, log_embs, times, attention_mask):
+        arget_dtype = next(self.projector.parameters()).dtype
+        log_embs = log_embs.to(target_dtype)
 
         x = self.projector(log_embs)                              # [B,L,H]
         B, L, _ = x.shape
@@ -415,17 +419,27 @@ class LogAnomalyModel(nn.Module):
         time_feats = []
         for b in range(B):
             t_list = times[b]
-            delta  = time_delta_features(t_list)                  # [Li,1]
-            parts  = []
+            delta = time_delta_features(t_list).to(pooled.device, pooled.dtype)
+
+            parts = []
             if self.time2vec is not None:
-                t2v = self.time2vec(delta.squeeze(-1).to(pooled.device))
+                t2v = self.time2vec(delta.squeeze(-1))
                 parts.append(t2v.mean(dim=0))
             if self.cfg.use_cyclic_time:
-                cyc = cyclic_time_features(t_list).to(pooled.device)
+                cyc = cyclic_time_features(t_list).to(pooled.device, pooled.dtype)
                 parts.append(cyc.mean(dim=0))
-            parts.append(delta.mean(dim=0).to(pooled.device))
+            parts.append(delta.mean(dim=0))
+
+            if getattr(self.cfg, "use_time_present", False):
+                has_time = torch.tensor(
+                    [1.0 if t is not None else 0.0 for t in t_list],
+                    device=pooled.device, dtype=pooled.dtype,
+                ).mean().unsqueeze(0)
+                parts.append(has_time)
+
             time_feats.append(torch.cat(parts))
-        time_feats = torch.stack(time_feats).to(pooled.dtype)
+
+        time_feats = torch.stack(time_feats)
 
         combined = torch.cat([pooled, time_feats], dim=-1)
         logits = self.classifier(combined).squeeze(-1)
@@ -519,8 +533,15 @@ def save_trainable(model, optimizer, scheduler, epoch, global_step, save_dir):
 def load_adapter_into(model, adapter_dir: str):
     from peft import PeftModel
     if isinstance(model.longformer, PeftModel):
-        model.longformer.load_adapter(adapter_dir, adapter_name="default")
-        model.longformer.set_adapter("default")
+        # уже PeftModel — просто грузим поверх
+        try:
+            model.longformer.load_adapter(adapter_dir, adapter_name="default")
+            model.longformer.set_adapter("default")
+        except Exception:
+            # fallback: пересоздаём
+            model.longformer = PeftModel.from_pretrained(
+                model.longformer.base_model, adapter_dir, is_trainable=True
+            )
     else:
         model.longformer = PeftModel.from_pretrained(
             model.longformer, adapter_dir, is_trainable=True
@@ -528,7 +549,6 @@ def load_adapter_into(model, adapter_dir: str):
     for n, p in model.longformer.named_parameters():
         if "lora_" in n:
             p.requires_grad_(True)
-
 
 def load_trainable(model, optimizer, scheduler, load_dir, device):
     ckpt = torch.load(os.path.join(load_dir, "train_state.pt"),

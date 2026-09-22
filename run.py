@@ -1,7 +1,8 @@
 """
-Config + run(). Клонируем репо → запускаем run() → создаётся HF-репо,
-туда кладутся LoRA-адаптеры и метрики. Следующий run() может дообучиться
-с прошлого чекпоинта, добавив K% данных.
+Config + run() + continue_training().
+Клонируем репо → run() создаёт HF-репо, кладёт LoRA-адаптеры и метрики.
+Продолжение: continue_training(state, cfg) в том же сеансе
+            или run(cfg) с resume_from_repo в новом.
 """
 import os
 import sys
@@ -13,6 +14,7 @@ import pickle
 import typing
 import dataclasses
 import datetime as _dt
+
 import tqdm.auto as tqdm
 import numpy as np
 import torch
@@ -41,29 +43,30 @@ from model import (
 @dataclasses.dataclass
 class Config:
     # ---------- данные ----------
-    dataset: str = "bgl"                       # bgl | tbird | spirit | liberty
+    dataset: str = "bgl"
     win_size: int = 199
     step_size: int = 199
     anchor_step: int = 10
     batch_size: int = 16
     num_workers: int = 0
     use_in_colab: bool = True
-    max_lines: typing.Optional[int] = None     # None = без лимита
+    max_lines: typing.Optional[int] = None
 
     # ---------- доли ----------
-    eval_start_ratio: float = 0.9              # фиксированная граница eval
-    train_ratio: float = 0.3                   # сколько лога реально обучаем
-    target_ratio: float = 0.3                  # доля аномалий в BalancedSampler
+    eval_start_ratio: float = 0.9
+    train_ratio: float = 0.3
+    target_ratio: float = 0.3
 
     # ---------- eval ----------
-    eval_max_windows: int = 2000               # мелкий eval во время обучения
-    metrics_log_every: int = 100               # шаг периодического eval
-    final_full_eval: bool = True               # полный eval после последней эпохи
+    eval_max_windows: int = 2000
+    metrics_log_every: int = 100
+    final_full_eval: bool = True
 
     # ---------- временные признаки ----------
     time_emb_len: int = 16
     use_time2vec: bool = True
     use_cyclic_time: bool = True
+    use_time_present: bool = True       # ← флаг has_time
 
     # ---------- Jasper ----------
     jasper_model_name: str = "infgrad/Jasper-Token-Compression-600M"
@@ -73,12 +76,12 @@ class Config:
 
     # ---------- Longformer ----------
     longformer_model_name: str = "allenai/longformer-base-4096"
-    longformer_layers: int = 12                # 4..24
-    longformer_attention_window: int = 50     # 128..4096 win_size + 1  кртаон размеру окна!!! todo:
+    longformer_layers: int = 12
+    longformer_attention_window: int = 199   # win_size + 1 должно быть кратно
 
     # ---------- агрегация ----------
     aggregate_layers: int = 4
-    aggregate_mode: str = "weighted"           # weighted | mean | attn_pool | last
+    aggregate_mode: str = "weighted"
     use_learned_cls: bool = True
 
     # ---------- квантизация ----------
@@ -87,8 +90,8 @@ class Config:
     bnb_quant_type: str = "nf4"
     bnb_double_quant: bool = True
     bnb_compute_dtype: str = "bfloat16"
-    mixed_dtype: str = "bfloat16"              # bfloat16 | float16 | float32
-    use_autocast: bool = False                 # True = fp32-веса + autocast
+    mixed_dtype: str = "bfloat16"
+    use_autocast: bool = False
 
     # ---------- LoRA ----------
     lora_r: int = 8
@@ -103,20 +106,20 @@ class Config:
     learning_rate: float = 1e-4
     weight_decay: float = 0.01
     warmup_steps: int = 200
-    scheduler_type: str = "linear"             # linear | cosine
+    scheduler_type: str = "linear"
     grad_clip: float = 1.0
     seed: int = 42
 
     # ---------- Hub ----------
     push_to_hub: bool = True
-    hub_repo_id: typing.Optional[str] = None   # None → <user>/<dataset>-log-anomaly
-    run_tag: typing.Optional[str] = None       # None → авто
-    resume_from_repo: typing.Optional[str] = None   # HF repo id с прошлым run
+    hub_repo_id: typing.Optional[str] = None
+    run_tag: typing.Optional[str] = None
+    resume_from_repo: typing.Optional[str] = None
     resume_from_run_tag: typing.Optional[str] = None
 
 
 # ============================================================
-# Хелперы Config ↔ JSON
+# Config ↔ JSON
 # ============================================================
 
 def cfg_to_json_dict(cfg: Config) -> dict:
@@ -132,18 +135,20 @@ def cfg_to_json(cfg: Config) -> str:
 
 
 # ============================================================
-# Сэмплер с фильтром (треним только < train_limit)
+# Сэмплеры и обёртки
 # ============================================================
 
 class FilteredSampler(Sampler):
-    def __init__(self, base, max_start: int):
+    """Оборачивает базовый сэмплер, отсекая индексы >= max_start.
+    Честная __len__ — материализует один раз и кэширует."""
+    def __init__(self, base: Sampler, max_start: int):
         self.base = base
         self.max_start = max_start
-        self._indices = None
+        self._indices: typing.Optional[np.ndarray] = None
 
     def _materialize(self):
         if self._indices is None:
-            self._indices = np.array(
+            self._indices = np.asarray(
                 [int(i) for i in self.base if int(i) < self.max_start],
                 dtype=np.int64,
             )
@@ -154,7 +159,7 @@ class FilteredSampler(Sampler):
 
     def __len__(self):
         self._materialize()
-        return len(self._indices)
+        return int(len(self._indices))
 
 
 class LimitedIterable(torch.utils.data.IterableDataset):
@@ -219,6 +224,7 @@ def upload_folder(local_dir: str, repo_id: str, path_in_repo: str):
 
 
 def download_folder(repo_id: str, path_in_repo: str, local_dir: str):
+    """Скачивает подпапку репо. Использует ** чтобы захватить вложенные файлы."""
     os.makedirs(local_dir, exist_ok=True)
     snapshot_download(
         repo_id=repo_id,
@@ -229,19 +235,23 @@ def download_folder(repo_id: str, path_in_repo: str, local_dir: str):
 
 
 # ============================================================
-# run()
+# train_loop
 # ============================================================
 
-_DATASET_CLS = {"bgl": BGL, "tbird": Tbird, "spirit": Spirit,
-                "liberty": Liberty}
-
 def train_loop(model, optimizer, scheduler, train_loader,
-               val_loader_small, val_loader_full, criterion, cfg,
-               device, autocast_ctx, line_cache, append_metric, history,
-               start_epoch: int, global_step: int):
-    """Один проход обучения. Возвращает global_step."""
-    epochs_bar = tqdm.trange(start_epoch, start_epoch + cfg.num_epochs,
-                             desc="training")
+               val_loader_small, val_loader_full, criterion, cfg, device,
+               autocast_ctx, line_cache, append_metric, history,
+               start_epoch: int, global_step: int,
+               repo_id: typing.Optional[str]):
+    """
+    Один прогон на cfg.num_epochs эпох, начиная с start_epoch.
+    Возвращает (new_start_epoch, global_step).
+    """
+    end_epoch = start_epoch + cfg.num_epochs
+    print(f"[train_loop] epochs {start_epoch}..{end_epoch-1} "
+          f"(global_step={global_step})")
+
+    epochs_bar = tqdm.trange(start_epoch, end_epoch, desc="training")
     for epoch in epochs_bar:
         model.train()
         running, n_run = 0.0, 0
@@ -265,9 +275,13 @@ def train_loop(model, optimizer, scheduler, train_loader,
                     [p for p in model.parameters() if p.requires_grad],
                     cfg.grad_clip,
                 )
-            optimizer.step(); scheduler.step()
+            optimizer.step()
+            scheduler.step()
 
-            running += loss.item(); n_run += 1; global_step += 1
+            running += loss.item()
+            n_run += 1
+            global_step += 1
+
             pbar.set_postfix({
                 "loss": f"{running / max(n_run, 1):.3f}",
                 "lr": f"{scheduler.get_last_lr()[0]:.2e}",
@@ -277,63 +291,150 @@ def train_loop(model, optimizer, scheduler, train_loader,
                 ev = evaluate(model, val_loader_small, device, criterion,
                               autocast_ctx=autocast_ctx,
                               max_windows=cfg.eval_max_windows)
-                append_metric({
-                    "run_tag": cfg.run_tag, "epoch": epoch,
-                    "global_step": global_step, "phase": "intra_epoch",
-                    "train_loss": running / max(n_run, 1), "eval": ev,
+                rec = {
+                    "run_tag": cfg.run_tag,
+                    "epoch": epoch,
+                    "global_step": global_step,
+                    "phase": "intra_epoch",
+                    "train_loss": running / max(n_run, 1),
+                    "eval": ev,
                     "train_ratio": cfg.train_ratio,
                     "eval_start_ratio": cfg.eval_start_ratio,
                     "elapsed_sec": time.time() - t0,
-                })
+                }
+                append_metric(rec)
                 print(f"[e{epoch} s{global_step}] "
                       f"train={running/max(n_run,1):.4f} "
-                      f"f1={ev['f1']:.4f} P={ev['precision']:.3f} "
+                      f"eval_f1={ev['f1']:.4f} P={ev['precision']:.3f} "
                       f"R={ev['recall']:.3f} n={ev['n_windows']}")
                 model.train()
 
+        # --- eval в конце эпохи (мелкий) ---
         ev = evaluate(model, val_loader_small, device, criterion,
                       autocast_ctx=autocast_ctx,
                       max_windows=cfg.eval_max_windows)
-        append_metric({
-            "run_tag": cfg.run_tag, "epoch": epoch,
-            "global_step": global_step, "phase": "end_of_epoch",
-            "train_loss": running / max(n_run, 1), "eval": ev,
+        rec = {
+            "run_tag": cfg.run_tag,
+            "epoch": epoch,
+            "global_step": global_step,
+            "phase": "end_of_epoch",
+            "train_loss": running / max(n_run, 1),
+            "eval": ev,
             "train_ratio": cfg.train_ratio,
             "eval_start_ratio": cfg.eval_start_ratio,
             "elapsed_sec": time.time() - t0,
-        })
-        print(f"[end e{epoch}] f1={ev['f1']:.4f} "
+        }
+        append_metric(rec)
+        print(f"[end e{epoch}] eval_f1={ev['f1']:.4f} "
               f"P={ev['precision']:.3f} R={ev['recall']:.3f} "
               f"n={ev['n_windows']} cache: {line_cache.stats()}")
 
+        # --- чекпоинт ---
         local_ckpt = f"/content/ckpt_{cfg.run_tag}_e{epoch}"
         save_trainable(model, optimizer, scheduler, epoch + 1,
                        global_step, local_ckpt)
-        if cfg.push_to_hub and cfg.hub_repo_id:
-            upload_folder(local_ckpt, cfg.hub_repo_id,
+        if repo_id:
+            upload_folder(local_ckpt, repo_id,
                           f"runs/{cfg.run_tag}/epoch_{epoch:02d}")
-            upload_folder(os.path.join(local_ckpt, "adapter"),
-                          cfg.hub_repo_id,
+            upload_folder(os.path.join(local_ckpt, "adapter"), repo_id,
                           f"runs/{cfg.run_tag}/adapter")
             upload_file(os.path.join(local_ckpt, "train_state.pt"),
-                        cfg.hub_repo_id,
-                        f"runs/{cfg.run_tag}/train_state.pt")
+                        repo_id, f"runs/{cfg.run_tag}/train_state.pt")
         print(f"[save] epoch {epoch} → {local_ckpt}")
 
+    # --- финальный полный eval ---
     if cfg.final_full_eval:
         ev = evaluate(model, val_loader_full, device, criterion,
-                      autocast_ctx=autocast_ctx, max_windows=None)
-        append_metric({
+                      autocast_ctx=autocast_ctx, max_windows=None,
+                      desc="final full eval")
+        rec = {
             "run_tag": cfg.run_tag,
-            "epoch": start_epoch + cfg.num_epochs - 1,
-            "global_step": global_step, "phase": "final_full",
-            "eval": ev, "train_ratio": cfg.train_ratio,
+            "epoch": end_epoch - 1,
+            "global_step": global_step,
+            "phase": "final_full",
+            "eval": ev,
+            "train_ratio": cfg.train_ratio,
             "eval_start_ratio": cfg.eval_start_ratio,
-        })
+        }
+        append_metric(rec)
         print(f"[final full eval] f1={ev['f1']:.4f} "
               f"P={ev['precision']:.3f} R={ev['recall']:.3f} "
               f"n={ev['n_windows']} (pos={ev['n_pos']})")
-    return global_step
+
+    return end_epoch, global_step
+
+
+# ============================================================
+# Вспомогательные сборки
+# ============================================================
+
+_DATASET_CLS = {"bgl": BGL, "tbird": Tbird, "spirit": Spirit,
+                "liberty": Liberty}
+
+
+def _build_loaders(ds, val_ds, cfg, line_cache):
+    collate = make_collate_fn(line_cache)
+    val_loader_small = DataLoader(
+        LimitedIterable(val_ds, cfg.eval_max_windows),
+        batch_size=cfg.batch_size, shuffle=False,
+        collate_fn=collate, num_workers=cfg.num_workers,
+    )
+    val_loader_full = DataLoader(
+        val_ds, batch_size=cfg.batch_size, shuffle=False,
+        collate_fn=collate, num_workers=cfg.num_workers,
+    )
+    return val_loader_small, val_loader_full
+
+
+def _build_train_loader(ds, eval_start_line, cfg, line_cache):
+    train_limit = int(ds.total_lines * cfg.train_ratio)
+    base_sampler = BalancedSampler(
+        ds, target_ratio=cfg.target_ratio, seed=cfg.seed,
+    )
+    # не даём окну залезть в eval-зону
+    safe_max = min(train_limit, eval_start_line - cfg.win_size)
+    train_sampler = FilteredSampler(base_sampler, max_start=safe_max)
+    collate = make_collate_fn(line_cache)
+    train_loader = DataLoader(
+        ds, batch_size=cfg.batch_size, sampler=train_sampler,
+        collate_fn=collate, num_workers=cfg.num_workers,
+    )
+    print(f"[loader] train_ratio={cfg.train_ratio} → "
+          f"train_limit={train_limit} safe_max={safe_max} "
+          f"окон={len(train_sampler)}")
+    return train_loader
+
+
+def _build_scheduler(optimizer, total_steps, cfg):
+    if cfg.scheduler_type == "cosine":
+        return torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=total_steps
+        )
+    from transformers import get_linear_schedule_with_warmup
+    return get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=cfg.warmup_steps,
+        num_training_steps=total_steps,
+    )
+
+
+def _build_model(cfg, jasper_dim, device):
+    """Три ветки dtype: quant / autocast / обычная."""
+    model = LogAnomalyModel(cfg, jasper_dim, device)
+    if cfg.use_quantization:
+        # bnb сам управляет compute dtype
+        pass
+    elif cfg.use_autocast:
+        # fp32 master-веса + autocast(bf16/fp16)
+        model = model.to(device).float()
+    else:
+        model = model.to(device).to(resolve_dtype(cfg))
+    return model
+
+
+# ============================================================
+# run()
+# ============================================================
 
 def run(cfg: Config):
     # --- seed ---
@@ -374,19 +475,14 @@ def run(cfg: Config):
                               train_ratio=cfg.eval_start_ratio)
     print(f"[data] total_lines={ds.total_lines}")
 
-    # eval всегда стартует с eval_start_ratio (фиксировано через train_ratio
-    # внутри SuperComputerDataset), а тренировка ограничивается train_ratio.
     val_ds = EvaluationDataset(ds)
     eval_start_line = val_ds.start_line
-    train_limit = int(ds.total_lines * cfg.train_ratio)
-    print(f"[data] eval_start_line={eval_start_line}, "
-          f"train_limit={train_limit}")
+    print(f"[data] eval_start_line={eval_start_line}")
 
-    # --- кэш эмбеддингов + collate ---
+    # --- Jasper + кэш + collate ---
     raw_encoder = load_jasper_encoder(
         cfg.jasper_model_name, cfg.compression_ratio, device=str(device)
     )
-    # определяем размерность
     probe = raw_encoder(["probe"])
     jasper_dim = probe.shape[-1]
     del probe
@@ -396,64 +492,30 @@ def run(cfg: Config):
         raw_encoder, max_lines=cfg.cache_max_lines,
         encode_batch=cfg.jasper_batch,
     )
-    collate = make_collate_fn(line_cache)
 
-    # --- сэмплер и лоадеры ---
-    base_sampler = BalancedSampler(
-        ds, target_ratio=cfg.target_ratio, seed=cfg.seed,
-    )
-    train_sampler = FilteredSampler(
-        base_sampler, max_start=min(train_limit, eval_start_line - cfg.win_size),
-    )
-    train_loader = DataLoader(
-        ds, batch_size=cfg.batch_size, sampler=train_sampler,
-        collate_fn=collate, num_workers=cfg.num_workers,
-    )
-    val_loader_small = DataLoader(
-        LimitedIterable(val_ds, cfg.eval_max_windows),
-        batch_size=cfg.batch_size, shuffle=False,
-        collate_fn=collate, num_workers=cfg.num_workers,
-    )
-    val_loader_full = DataLoader(
-        val_ds, batch_size=cfg.batch_size, shuffle=False,
-        collate_fn=collate, num_workers=cfg.num_workers,
+    # --- лоадеры ---
+    train_loader = _build_train_loader(ds, eval_start_line, cfg, line_cache)
+    val_loader_small, val_loader_full = _build_loaders(
+        ds, val_ds, cfg, line_cache
     )
 
-    # --- модель ---
-    model = LogAnomalyModel(cfg, jasper_dim, device)
-    model = model.to(device)
-    if not cfg.use_quantization and resolve_dtype(cfg) != torch.float32:
-        model = model.to(resolve_dtype(cfg))
-    # эмбеддинги Jasper приходят в bf16 — если модель в fp32, это несовместимо.
-    if not cfg.use_quantization and resolve_dtype(cfg) == torch.float32:
-        # оставляем модель в fp32, будем кастовать в collate/forward
-        pass
+    # --- модель (три ветки dtype) ---
+    model = _build_model(cfg, jasper_dim, device)
+    n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    n_total = sum(p.numel() for p in model.parameters())
+    print(f"[opt] trainable={n_train:,} / total={n_total:,} "
+          f"({n_train / max(n_total, 1) * 100:.2f}%)")
 
-    # ============================================================
-    # Оптимизатор + шедулер (создаём ДО resume — load_trainable грузит в них state)
-    # ============================================================
-    start_epoch, global_step = 0, 0
-
+    # --- optimizer + scheduler ДО resume ---
     optimizer = torch.optim.AdamW(
         [p for p in model.parameters() if p.requires_grad],
         lr=cfg.learning_rate, weight_decay=cfg.weight_decay,
     )
-    total_steps = max(1, len(train_sampler) // cfg.batch_size * cfg.num_epochs)
-    if cfg.scheduler_type == "cosine":
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=total_steps
-        )
-    else:
-        from transformers import get_linear_schedule_with_warmup
-        scheduler = get_linear_schedule_with_warmup(
-            optimizer,
-            num_warmup_steps=cfg.warmup_steps,
-            num_training_steps=total_steps,
-        )
+    total_steps = max(1, len(train_loader) * cfg.num_epochs)
+    scheduler = _build_scheduler(optimizer, total_steps, cfg)
 
-    # ============================================================
-    # Resume (опционально)
-    # ============================================================
+    # --- resume ---
+    start_epoch, global_step = 0, 0
     if cfg.resume_from_repo and cfg.resume_from_run_tag:
         resume_path_in_repo = f"runs/{cfg.resume_from_run_tag}"
         local_ckpt = "/content/ckpt_resume"
@@ -475,13 +537,11 @@ def run(cfg: Config):
         )
         print(f"[resume] start_epoch={start_epoch} step={global_step}")
 
-    # ============================================================
-    # Loss + autocast
-    # ============================================================
+    # --- loss + autocast ---
     criterion = torch.nn.BCEWithLogitsLoss()
     autocast_ctx = autocast_context(cfg)
 
-    # --- загружаем историю метрик, если она уже есть в репо ---
+    # --- история метрик ---
     local_metrics_path = f"/content/metrics_{cfg.run_tag}.pkl"
     history: list = []
     if repo_id:
@@ -511,135 +571,31 @@ def run(cfg: Config):
                     f"{run_path_in_repo}/config.json")
 
     # --- обучение ---
-    epochs_bar = tqdm.trange(start_epoch, cfg.num_epochs, desc="training")
-    for epoch in epochs_bar:
-        model.train()
-        running, n_run = 0.0, 0
-        t0 = time.time()
-
-        pbar = tqdm.tqdm(train_loader, desc=f"epoch {epoch}", leave=False)
-        for step, batch in enumerate(pbar):
-            if batch is None:
-                continue
-            log_embs = batch["log_embs"].to(device)
-            mask     = batch["attention_mask"].to(device)
-            y        = batch["labels"].to(device)
-
-            optimizer.zero_grad()
-            with autocast_ctx:
-                logits = model(log_embs, batch["times"], mask)
-            loss = criterion(logits.float(), y)
-            loss.backward()
-            if cfg.grad_clip:
-                torch.nn.utils.clip_grad_norm_(
-                    [p for p in model.parameters() if p.requires_grad],
-                    cfg.grad_clip,
-                )
-            optimizer.step()
-            scheduler.step()
-
-            running += loss.item()
-            n_run += 1
-            global_step += 1
-
-            pbar.set_postfix({
-                "loss": f"{running / max(n_run, 1):.3f}",
-                "lr": f"{scheduler.get_last_lr()[0]:.2e}",
-            })
-            # if cfg.max_train_batches is not None and step >= cfg.max_train_batches:
-            #     break
-
-            if cfg.metrics_log_every and (step + 1) % cfg.metrics_log_every == 0:
-                ev = evaluate(model, val_loader_small, device, criterion,
-                              autocast_ctx=autocast_ctx,
-                              max_windows=cfg.eval_max_windows)
-                rec = {
-                    "run_tag": cfg.run_tag,
-                    "epoch": epoch,
-                    "global_step": global_step,
-                    "phase": "intra_epoch",
-                    "train_loss": running / max(n_run, 1),
-                    "eval": ev,
-                    "train_ratio": cfg.train_ratio,
-                    "eval_start_ratio": cfg.eval_start_ratio,
-                    "elapsed_sec": time.time() - t0,
-                }
-                append_metric(rec)
-                print(f"[e{epoch} s{global_step}] train={running/max(n_run,1):.4f} "
-                      f"eval_f1={ev['f1']:.4f} P={ev['precision']:.3f} "
-                      f"R={ev['recall']:.3f} n={ev['n_windows']}")
-                model.train()
-
-        # --- eval в конце эпохи (мелкий) ---
-        ev = evaluate(model, val_loader_small, device, criterion,
-                      autocast_ctx=autocast_ctx,
-                      max_windows=cfg.eval_max_windows)
-        rec = {
-            "run_tag": cfg.run_tag,
-            "epoch": epoch,
-            "global_step": global_step,
-            "phase": "end_of_epoch",
-            "train_loss": running / max(n_run, 1),
-            "eval": ev,
-            "train_ratio": cfg.train_ratio,
-            "eval_start_ratio": cfg.eval_start_ratio,
-            "elapsed_sec": time.time() - t0,
-        }
-        append_metric(rec)
-        print(f"[end e{epoch}] eval_f1={ev['f1']:.4f} "
-              f"P={ev['precision']:.3f} R={ev['recall']:.3f} "
-              f"n={ev['n_windows']} cache: {line_cache.stats()}")
-
-        # --- чекпоинт на HF ---
-        local_ckpt = f"/content/ckpt_{cfg.run_tag}_e{epoch}"
-        save_trainable(model, optimizer, scheduler, epoch + 1,
-                       global_step, local_ckpt)
-        if repo_id:
-            upload_folder(local_ckpt, repo_id,
-                          f"{run_path_in_repo}/epoch_{epoch:02d}")
-            upload_folder(os.path.join(local_ckpt, "adapter"), repo_id,
-                          f"{run_path_in_repo}/adapter")   # перезаписываем latest
-            upload_file(os.path.join(local_ckpt, "train_state.pt"),
-                        repo_id, f"{run_path_in_repo}/train_state.pt")
-        print(f"[save] epoch {epoch} → {local_ckpt}")
-
-    # --- финальный полный eval ---
-    if cfg.final_full_eval:
-        ev = evaluate(model, val_loader_full, device, criterion,
-                      autocast_ctx=autocast_ctx, max_windows=None)
-        rec = {
-            "run_tag": cfg.run_tag,
-            "epoch": cfg.num_epochs - 1,
-            "global_step": global_step,
-            "phase": "final_full",
-            "eval": ev,
-            "train_ratio": cfg.train_ratio,
-            "eval_start_ratio": cfg.eval_start_ratio,
-        }
-        append_metric(rec)
-        print(f"[final full eval] f1={ev['f1']:.4f} "
-              f"P={ev['precision']:.3f} R={ev['recall']:.3f} "
-              f"n={ev['n_windows']} (pos={ev['n_pos']})")
+    start_epoch, global_step = train_loop(
+        model, optimizer, scheduler, train_loader,
+        val_loader_small, val_loader_full, criterion, cfg, device,
+        autocast_ctx, line_cache, append_metric, history,
+        start_epoch, global_step, repo_id,
+    )
 
     # --- финальный чекпоинт ---
     local_final = f"/content/final_{cfg.run_tag}"
-    save_trainable(model, optimizer, scheduler, cfg.num_epochs,
+    save_trainable(model, optimizer, scheduler, start_epoch,
                    global_step, local_final)
     if repo_id:
         upload_folder(local_final, repo_id,
                       f"{run_path_in_repo}/final")
         upload_file(local_metrics_path, repo_id,
                     f"{run_path_in_repo}/metrics.pkl")
-        # объединённая история по всем run'ам
+        # объединённая история
         merged = "/content/metrics_history.pkl"
         merged_data = []
-        if repo_id:
-            try:
-                cached = hf_hub_download(repo_id, "metrics_history.pkl")
-                with open(cached, "rb") as f:
-                    merged_data = pickle.load(f)
-            except Exception:
-                pass
+        try:
+            cached = hf_hub_download(repo_id, "metrics_history.pkl")
+            with open(cached, "rb") as f:
+                merged_data = pickle.load(f)
+        except Exception:
+            pass
         merged_data.extend(history)
         with open(merged, "wb") as f:
             pickle.dump(merged_data, f)
@@ -647,10 +603,123 @@ def run(cfg: Config):
         print(f"[hf] done → https://huggingface.co/{repo_id}")
 
     return {
-        "model": model, "optimizer": optimizer, "scheduler": scheduler,
+        "model": model,
+        "optimizer": optimizer,
+        "scheduler": scheduler,
         "train_loader": train_loader,
-        "val_loader_small": val_loader_small, "val_loader_full": val_loader_full,
-        "criterion": criterion, "autocast_ctx": autocast_ctx,
-        "line_cache": line_cache, "history": history,
-        "global_step": global_step, "append_metric": append_metric,
+        "val_loader_small": val_loader_small,
+        "val_loader_full": val_loader_full,
+        "criterion": criterion,
+        "autocast_ctx": autocast_ctx,
+        "line_cache": line_cache,
+        "history": history,
+        "append_metric": append_metric,
+        "global_step": global_step,
+        "start_epoch": start_epoch,
+        # для continue_training
+        "dataset": ds,
+        "val_dataset": val_ds,
+        "eval_start_line": eval_start_line,
+        "train_ratio": cfg.train_ratio,
+        "run_tag": cfg.run_tag,
+        "cfg": cfg,
+        "device": device,
+        "repo_id": repo_id,
     }
+
+
+# ============================================================
+# continue_training — in-memory дообучение
+# ============================================================
+
+def continue_training(state: dict, cfg: Config) -> dict:
+    """
+    Продолжает обучение на тех же объектах (модель, оптимизатор, история).
+    Пересобирает train_loader, если cfg.train_ratio изменился.
+    Возвращает обновлённый state.
+    """
+    model = state["model"]
+    optimizer = state["optimizer"]
+    criterion = state["criterion"]
+    device = state["device"]
+    line_cache = state["line_cache"]
+    history = state["history"]
+    global_step = state["global_step"]
+    autocast_ctx = state["autocast_ctx"]
+    ds = state["dataset"]
+    val_ds = state["val_dataset"]
+    eval_start_line = state["eval_start_line"]
+    repo_id = cfg.hub_repo_id if cfg.push_to_hub else None
+
+    # --- train_loader ---
+    if cfg.train_ratio != state.get("train_ratio") \
+       or cfg.batch_size != state["cfg"].batch_size:
+        train_loader = _build_train_loader(ds, eval_start_line, cfg, line_cache)
+    else:
+        train_loader = state["train_loader"]
+
+    # --- val_loader пересобираем при смене batch_size ---
+    if cfg.batch_size != state["cfg"].batch_size:
+        val_loader_small, val_loader_full = _build_loaders(
+            ds, val_ds, cfg, line_cache
+        )
+    else:
+        val_loader_small = state["val_loader_small"]
+        val_loader_full = state["val_loader_full"]
+
+    # --- scheduler (optimizer state сохраняется) ---
+    total_steps = max(1, len(train_loader) * cfg.num_epochs)
+    scheduler = _build_scheduler(optimizer, total_steps, cfg)
+
+    # --- новый append_metric (run_tag мог поменяться) ---
+    local_metrics_path = f"/content/metrics_{cfg.run_tag}.pkl"
+
+    def append_metric(record: dict):
+        record["run_tag"] = cfg.run_tag
+        history.append(record)
+        with open(local_metrics_path, "wb") as f:
+            pickle.dump(history, f)
+        if repo_id:
+            upload_file(local_metrics_path, repo_id,
+                        f"runs/{cfg.run_tag}/metrics.pkl")
+
+    # --- конфиг нового run в репо ---
+    if repo_id:
+        with open("/content/config_run.json", "w") as f:
+            f.write(cfg_to_json(cfg))
+        upload_file("/content/config_run.json", repo_id,
+                    f"runs/{cfg.run_tag}/config.json")
+
+    # --- train_loop ---
+    start_epoch = state["start_epoch"]
+    start_epoch, global_step = train_loop(
+        model, optimizer, scheduler, train_loader,
+        val_loader_small, val_loader_full, criterion, cfg, device,
+        autocast_ctx, line_cache, append_metric, history,
+        start_epoch, global_step, repo_id,
+    )
+
+    # --- финальный чекпоинт ---
+    local_final = f"/content/final_{cfg.run_tag}"
+    save_trainable(model, optimizer, scheduler, start_epoch,
+                   global_step, local_final)
+    if repo_id:
+        upload_folder(local_final, repo_id,
+                      f"runs/{cfg.run_tag}/final")
+        upload_file(local_metrics_path, repo_id,
+                    f"runs/{cfg.run_tag}/metrics.pkl")
+
+    state.update({
+        "cfg": cfg,
+        "train_loader": train_loader,
+        "val_loader_small": val_loader_small,
+        "val_loader_full": val_loader_full,
+        "scheduler": scheduler,
+        "run_tag": cfg.run_tag,
+        "train_ratio": cfg.train_ratio,
+        "start_epoch": start_epoch,
+        "global_step": global_step,
+        "append_metric": append_metric,
+        "repo_id": repo_id,
+    })
+    return state
