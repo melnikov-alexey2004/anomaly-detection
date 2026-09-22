@@ -77,7 +77,7 @@ class Config:
     # ---------- Longformer ----------
     longformer_model_name: str = "allenai/longformer-base-4096"
     longformer_layers: int = 12
-    longformer_attention_window: int = 199   # win_size + 1 должно быть кратно
+    longformer_attention_window: int = 100   # win_size + 1 % longformer_attention_window == 0должно быть кратно
 
     # ---------- агрегация ----------
     aggregate_layers: int = 4
@@ -419,13 +419,17 @@ def _build_scheduler(optimizer, total_steps, cfg):
 
 
 def _build_model(cfg, jasper_dim, device):
-    """Три ветки dtype: quant / autocast / обычная."""
     model = LogAnomalyModel(cfg, jasper_dim, device)
     if cfg.use_quantization:
-        # bnb сам управляет compute dtype
-        pass
+        # longformer уже на device через device_map; головы надо явно перенести
+        model.projector  = model.projector.to(device)
+        model.aggregator = model.aggregator.to(device)
+        model.classifier = model.classifier.to(device)
+        if model.time2vec is not None:
+            model.time2vec = model.time2vec.to(device)
+        if model.use_cls:
+            model.cls_emb = torch.nn.Parameter(model.cls_emb.data.to(device))
     elif cfg.use_autocast:
-        # fp32 master-веса + autocast(bf16/fp16)
         model = model.to(device).float()
     else:
         model = model.to(device).to(resolve_dtype(cfg))

@@ -373,12 +373,20 @@ class LogAnomalyModel(nn.Module):
     def load_head_state_dict(self, sd: dict):
         own = dict(self.named_parameters())
         for name, tensor in sd.items():
-            if name in own:
-                own[name].data.copy_(tensor.to(own[name].device,
-                                                dtype=own[name].dtype))
+            if name not in own:
+                print(f"[load_head] пропущено (нет в модели): {name}")
+                continue
+            if own[name].shape != tensor.shape:
+                raise RuntimeError(
+                    f"[load_head] shape mismatch для {name}: "
+                    f"ckpt {tuple(tensor.shape)} vs model {tuple(own[name].shape)}. "
+                    f"Не меняйте use_time_present/aggregate_layers/time_emb_len при resume."
+                )
+            own[name].data.copy_(tensor.to(own[name].device, dtype=own[name].dtype))
+
 
     def forward(self, log_embs, times, attention_mask):
-        arget_dtype = next(self.projector.parameters()).dtype
+        target_dtype = next(self.projector.parameters()).dtype
         log_embs = log_embs.to(target_dtype)
 
         x = self.projector(log_embs)                              # [B,L,H]
