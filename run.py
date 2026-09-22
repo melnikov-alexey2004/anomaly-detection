@@ -322,60 +322,55 @@ def run(cfg: Config):
         # оставляем модель в fp32, будем кастовать в collate/forward
         pass
 
-    # --- resume ---
+    # ============================================================
+    # Оптимизатор + шедулер (создаём ДО resume — load_trainable грузит в них state)
+    # ============================================================
     start_epoch, global_step = 0, 0
+
+    optimizer = torch.optim.AdamW(
+        [p for p in model.parameters() if p.requires_grad],
+        lr=cfg.learning_rate, weight_decay=cfg.weight_decay,
+    )
+    total_steps = max(1, len(train_sampler) // cfg.batch_size * cfg.num_epochs)
+    if cfg.scheduler_type == "cosine":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=total_steps
+        )
+    else:
+        from transformers import get_linear_schedule_with_warmup
+        scheduler = get_linear_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=cfg.warmup_steps,
+            num_training_steps=total_steps,
+        )
+
+    # ============================================================
+    # Resume (опционально)
+    # ============================================================
     if cfg.resume_from_repo and cfg.resume_from_run_tag:
         resume_path_in_repo = f"runs/{cfg.resume_from_run_tag}"
         local_ckpt = "/content/ckpt_resume"
         print(f"[resume] download {cfg.resume_from_repo}/{resume_path_in_repo}")
         download_folder(cfg.resume_from_repo, resume_path_in_repo, local_ckpt)
-        adapter_dir = os.path.join(
-            local_ckpt, resume_path_in_repo.split("/")[-1], "adapter"
-        )
-        train_state_dir = os.path.join(
-            local_ckpt, resume_path_in_repo.split("/")[-1]
-        )
-        load_adapter_into(model, adapter_dir)
 
-        # optimizer/scheduler создаём до load
-        optimizer = torch.optim.AdamW(
-            [p for p in model.parameters() if p.requires_grad],
-            lr=cfg.learning_rate, weight_decay=cfg.weight_decay,
-        )
-        total_steps = max(1, len(train_sampler) // cfg.batch_size * cfg.num_epochs)
-        if cfg.scheduler_type == "cosine":
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer, T_max=total_steps
-            )
-        else:
-            from transformers import get_linear_schedule_with_warmup
-            scheduler = get_linear_schedule_with_warmup(
-                optimizer,
-                num_warmup_steps=cfg.warmup_steps,
-                num_training_steps=total_steps,
-            )
+        adapter_dir = os.path.join(local_ckpt, resume_path_in_repo, "adapter")
+        train_state_dir = os.path.join(local_ckpt, resume_path_in_repo)
+
+        print(f"[resume] adapter_dir={adapter_dir}")
+        print(f"[resume] train_state_dir={train_state_dir}")
+        assert os.path.isdir(adapter_dir), f"нет папки адаптера: {adapter_dir}"
+        assert os.path.isfile(os.path.join(train_state_dir, "train_state.pt")), \
+            f"нет train_state.pt в {train_state_dir}"
+
+        load_adapter_into(model, adapter_dir)
         start_epoch, global_step = load_trainable(
             model, optimizer, scheduler, train_state_dir, device
         )
         print(f"[resume] start_epoch={start_epoch} step={global_step}")
-    else:
-        optimizer = torch.optim.AdamW(
-            [p for p in model.parameters() if p.requires_grad],
-            lr=cfg.learning_rate, weight_decay=cfg.weight_decay,
-        )
-        total_steps = max(1, len(train_sampler) // cfg.batch_size * cfg.num_epochs)
-        if cfg.scheduler_type == "cosine":
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer, T_max=total_steps
-            )
-        else:
-            from transformers import get_linear_schedule_with_warmup
-            scheduler = get_linear_schedule_with_warmup(
-                optimizer,
-                num_warmup_steps=cfg.warmup_steps,
-                num_training_steps=total_steps,
-            )
 
+    # ============================================================
+    # Loss + autocast
+    # ============================================================
     criterion = torch.nn.BCEWithLogitsLoss()
     autocast_ctx = autocast_context(cfg)
 
