@@ -825,6 +825,30 @@ def continue_training(state: dict, cfg: Config) -> dict:
         upload_file(local_metrics_path, repo_id,
                     f"runs/{cfg.run_tag}/metrics.pkl")
 
+        # ─── merge в metrics_history.pkl ───
+        merged = "/content/metrics_history.pkl"
+        merged_data = []
+        try:
+            cached = hf_hub_download(repo_id, "metrics_history.pkl")
+            with open(cached, "rb") as f:
+                merged_data = pickle.load(f)
+        except Exception:
+            pass
+
+        def _key(r):
+            return (r.get("run_tag"), r.get("global_step"), r.get("phase"))
+
+        seen = {_key(r) for r in merged_data}
+        new_records = [r for r in history if _key(r) not in seen]
+        print(f"[metrics_history] было {len(merged_data)}, "
+              f"новых {len(new_records)}, "
+              f"дубликатов {len(history) - len(new_records)}")
+
+        merged_data.extend(new_records)
+        with open(merged, "wb") as f:
+            pickle.dump(merged_data, f)
+        upload_file(merged, repo_id, "metrics_history.pkl")
+
     state.update({
         "cfg": cfg,
         "train_loader": train_loader,
