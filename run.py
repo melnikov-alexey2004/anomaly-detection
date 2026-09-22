@@ -13,7 +13,7 @@ import pickle
 import typing
 import dataclasses
 import datetime as _dt
-from tqdm.auto import tqdm
+import tqdm.auto as tqdm
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Sampler
@@ -409,13 +409,13 @@ def run(cfg: Config):
                     f"{run_path_in_repo}/config.json")
 
     # --- обучение ---
-    epochs_bar = tqdm(range(start_epoch, cfg.num_epochs), desc="training")
+    epochs_bar = tqdm.trange(start_epoch, cfg.num_epochs, desc="training")
     for epoch in epochs_bar:
         model.train()
         running, n_run = 0.0, 0
         t0 = time.time()
 
-        pbar = tqdm(train_loader, desc=f"epoch {epoch}", leave=False)
+        pbar = tqdm.tqdm(train_loader, desc=f"epoch {epoch}", leave=False)
         for step, batch in enumerate(pbar):
             if batch is None:
                 continue
