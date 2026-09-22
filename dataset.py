@@ -481,12 +481,22 @@ class Liberty(Data):
 import numpy as np
 
 class BalancedSampler(Sampler):
-    def __init__(self, dataset: SuperComputerDataset, target_ratio=0.3, max_samples=None, min_samples=1000,
-                 seed: typing.Optional[int]=None):
+    def __init__(self, dataset: SuperComputerDataset, target_ratio=0.3,
+                 max_samples=None, min_samples=1000, seed=None,
+                 max_oversample_factor=10.0,     # ← новое
+                 min_minority_for_balance=50):   # ← новое
+        """
+        max_oversample_factor: во сколько раз максимум можно повторять minority.
+            10.0 — разумно. Больше — модель заучит единичные примеры.
+        min_minority_for_balance: если minority меньше этого числа,
+            балансировка отключается, сэмплер становится uniform.
+        """
         self.dataset = dataset
         self.target_ratio = target_ratio
         self.max_samples = max_samples
-        self.min_samples = min_samples  # only if max_samples is None, min_samples can work
+        self.min_samples = min_samples
+        self.max_oversample_factor = max_oversample_factor
+        self.min_minority_for_balance = min_minority_for_balance
 
         self.W = dataset.window_size
         self.N = dataset.total_lines
@@ -500,10 +510,6 @@ class BalancedSampler(Sampler):
         self.normal_indices = all_starts[~has_anom]
         self.anomalous_indices = all_starts[has_anom]
 
-        # self.normal_indices = np.where(self.labels == 0)[0]
-        # self.anomalous_indices = np.where(self.labels == 1)[0]
-
-
         if len(self.anomalous_indices) <= len(self.normal_indices):
             self.minority_label, self.majority_label = "abnormal", "normal"
             self.minority_indices, self.majority_indices = self.anomalous_indices, self.normal_indices
@@ -511,56 +517,82 @@ class BalancedSampler(Sampler):
             self.minority_label, self.majority_label = "normal", "abnormal"
             self.minority_indices, self.majority_indices = self.normal_indices, self.anomalous_indices
 
+        n_min = len(self.minority_indices)
+        n_maj = len(self.majority_indices)
+
         print(f'sampler: a={len(self.anomalous_indices)}, n={len(self.normal_indices)}')
-        t = len(self.anomalous_indices) + len(self.normal_indices)
-        if t > 0: print(f'sampler: frac_a={len(self.anomalous_indices)/t*100:.2f}%, frac_n={len(self.normal_indices)/t*100:.2f}%')
+        t = n_min + n_maj
+        if t > 0:
+            print(f'sampler: frac_a={len(self.anomalous_indices)/t*100:.2f}%, '
+                  f'frac_n={len(self.normal_indices)/t*100:.2f}%')
 
-        self.minority_count = max(int((self.target_ratio * len(self.majority_indices)) / (1 - self.target_ratio)), len(self.minority_indices))
-        self.total_size = self.minority_count + len(self.majority_indices)
+        # ─── новая логика: проверка, стоит ли вообще балансировать ───
+        self.balance_enabled = True
+        if n_min == 0:
+            print(f"[sampler] WARNING: minority ({self.minority_label}) = 0. "
+                  f"Обучение без балансировки невозможно.")
+            self.balance_enabled = False
+            self.minority_count = 0
+            self.total_size = n_maj
 
-        if len(self.minority_indices) == 0:
-            warnings.warn(f"нет ни одного окна с меткой {self.minority_label}")
+        elif n_min < self.min_minority_for_balance:
+            print(f"[sampler] WARNING: minority ({self.minority_label}) = {n_min} "
+                  f"< {self.min_minority_for_balance}. Балансировка отключена, "
+                  f"используем uniform sampling.")
+            print(f"[sampler] СОВЕТ: увеличьте train_ratio или используйте "
+                  f"pos_weight в BCE, если minority реально редкий.")
+            self.balance_enabled = False
+            self.minority_count = n_min
+            self.total_size = n_min + n_maj
 
-        if len(self.majority_indices) == 0:
-            warnings.warn(f"нет ни одного окна с меткой {self.majority_label}")
+        else:
+            # обычная логика с cap на oversample
+            target_minority = int((self.target_ratio * n_maj) / (1 - self.target_ratio))
+            oversample_cap = int(n_min * self.max_oversample_factor)
 
-        if max_samples is not None:
-            if max_samples > self.total_size:
-                warnings.warn(f"max_samples > total, {max_samples=}, {self.total_size=}")
-                warnings.warn(f"total осталось прежним")
-                print(f"total c {self.total_size} остался как и был при {max_samples=}")
+            self.minority_count = max(
+                n_min,                              # не undersample'ить
+                min(target_minority, oversample_cap)  # не oversample'ить больше cap
+            )
+            self.total_size = self.minority_count + n_maj
 
-            else:
-                # total >= max_samples
-                # соханяем  нужную долю
-                print(f"total c {self.total_size} урезали до: {max_samples}")
-                self.total_size = max_samples
+            if self.minority_count < target_minority:
+                actual_ratio = self.minority_count / self.total_size
+                print(f"[sampler] minority capped: {self.minority_count} "
+                      f"(target был {target_minority}, cap factor={self.max_oversample_factor}). "
+                      f"Фактический target_ratio={actual_ratio:.3f} вместо {self.target_ratio}")
+
+        # max_samples / min_samples как раньше, только если балансировка включена
+        if self.balance_enabled:
+            if max_samples is not None:
+                if max_samples > self.total_size:
+                    warnings.warn(f"max_samples > total, {max_samples=}, {self.total_size=}")
+                else:
+                    print(f"total c {self.total_size} урезали до: {max_samples}")
+                    self.total_size = max_samples
+                    self.minority_count = int(self.total_size * self.target_ratio)
+
+            elif min_samples and self.total_size < min_samples:
+                print(f"min_samples: {self.total_size} увеличено до {min_samples}")
+                self.total_size = min_samples
                 self.minority_count = int(self.total_size * self.target_ratio)
 
-        elif min_samples and self.total_size < min_samples:
-            # если дополняем до нужного числа объектов то доля будет tar_rat
-            print(f"min_samples: {self.total_size} увеличено до {self.min_samples}")
-            self.total_size = min_samples
-            self.minority_count = int(self.total_size * self.target_ratio)
-            # если бы требовалось покрыть все минорные за одну эпоху
-            # self.minority_count = min(
-            #     self.total_size,
-            #     max(int(self.total_size * self.target_ratio), len(self.minority_indices)),
-            # )
+        if n_min == 0:
+            warnings.warn(f"нет ни одного окна с меткой {self.minority_label}")
+        if n_maj == 0:
+            warnings.warn("нет ни одного окна с меткой мажоритарного класса")
 
-        if len(self.minority_indices) == 0:
-            # только мажоритарный класс
-            warnings.warn("только мажоритарный класс")
-            self.minority_count = 0
-            self.total_size = len(self.majority_indices)
-        if len(self.majority_indices) == 0:
-            # только минорный класс
-            warnings.warn("только минорный класс")
-            self.minority_count = len(self.minority_indices)
-            self.total_size = len(self.minority_indices)
+        print(f"[sampler] итог: minority={self.minority_count}, "
+              f"majority={self.total_size - self.minority_count}, "
+              f"total={self.total_size}, "
+              f"balance={'ON' if self.balance_enabled else 'OFF'}, "
+              f"actual_frac_minority="
+              f"{self.minority_count / max(self.total_size, 1) * 100:.1f}%")
 
         self.seed = seed
         self.rng = None
+
+    # sample_count, __iter__, __len__ — без изменений
 
     def sample_count(self, array: np.ndarray, count: int) -> np.ndarray:
         if count < len(array):
