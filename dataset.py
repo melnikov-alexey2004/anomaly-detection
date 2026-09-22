@@ -481,16 +481,18 @@ class Liberty(Data):
 import numpy as np
 
 class BalancedSampler(Sampler):
-    def __init__(self, dataset: SuperComputerDataset, target_ratio=0.3,
-                 max_samples=None, min_samples=1000, seed=None,
-                 max_oversample_factor=10.0,     # ← новое
-                 min_minority_for_balance=50):   # ← новое
-        """
-        max_oversample_factor: во сколько раз максимум можно повторять minority.
-            10.0 — разумно. Больше — модель заучит единичные примеры.
-        min_minority_for_balance: если minority меньше этого числа,
-            балансировка отключается, сэмплер становится uniform.
-        """
+    """
+    Балансирует классы oversample'ом minority.
+
+    max_oversample_factor: максимум, во сколько раз можно повторить
+        каждый minority-пример за эпоху. Защита от заучивания.
+    min_minority_for_balance: если minority меньше — балансировка
+        отключается, сэмплер работает как uniform.
+    """
+    def __init__(self, dataset, target_ratio=0.3, max_samples=None,
+                 min_samples=1000, seed=None,
+                 max_oversample_factor: float = 10.0,
+                 min_minority_for_balance: int = 50):
         self.dataset = dataset
         self.target_ratio = target_ratio
         self.max_samples = max_samples
@@ -503,7 +505,8 @@ class BalancedSampler(Sampler):
         self.step_size = dataset.step_size
         labels = self.dataset.labels
 
-        all_starts = np.arange(0, self.N - self.W + 1, self.step_size, dtype=np.int64)
+        all_starts = np.arange(0, self.N - self.W + 1,
+                               self.step_size, dtype=np.int64)
         prefix = np.zeros(self.N + 1, dtype=np.int64)
         prefix[1:] = np.cumsum(labels)
         has_anom = (prefix[all_starts + self.W] - prefix[all_starts]) > 0
@@ -512,93 +515,85 @@ class BalancedSampler(Sampler):
 
         if len(self.anomalous_indices) <= len(self.normal_indices):
             self.minority_label, self.majority_label = "abnormal", "normal"
-            self.minority_indices, self.majority_indices = self.anomalous_indices, self.normal_indices
+            self.minority_indices = self.anomalous_indices
+            self.majority_indices = self.normal_indices
         else:
             self.minority_label, self.majority_label = "normal", "abnormal"
-            self.minority_indices, self.majority_indices = self.normal_indices, self.anomalous_indices
+            self.minority_indices = self.normal_indices
+            self.majority_indices = self.anomalous_indices
 
         n_min = len(self.minority_indices)
         n_maj = len(self.majority_indices)
 
-        print(f'sampler: a={len(self.anomalous_indices)}, n={len(self.normal_indices)}')
+        print(f'sampler: a={len(self.anomalous_indices)}, '
+              f'n={len(self.normal_indices)}')
         t = n_min + n_maj
         if t > 0:
             print(f'sampler: frac_a={len(self.anomalous_indices)/t*100:.2f}%, '
                   f'frac_n={len(self.normal_indices)/t*100:.2f}%')
 
-        # ─── новая логика: проверка, стоит ли вообще балансировать ───
         self.balance_enabled = True
         if n_min == 0:
-            print(f"[sampler] WARNING: minority ({self.minority_label}) = 0. "
-                  f"Обучение без балансировки невозможно.")
+            print(f"[sampler] WARNING: minority ({self.minority_label}) = 0")
             self.balance_enabled = False
             self.minority_count = 0
             self.total_size = n_maj
-
         elif n_min < self.min_minority_for_balance:
-            print(f"[sampler] WARNING: minority ({self.minority_label}) = {n_min} "
-                  f"< {self.min_minority_for_balance}. Балансировка отключена, "
-                  f"используем uniform sampling.")
-            print(f"[sampler] СОВЕТ: увеличьте train_ratio или используйте "
-                  f"pos_weight в BCE, если minority реально редкий.")
+            print(f"[sampler] WARNING: minority={n_min} < "
+                  f"{self.min_minority_for_balance}. Балансировка отключена.")
+            print(f"[sampler] СОВЕТ: увеличьте train_ratio или "
+                  f"используйте pos_weight в BCE.")
             self.balance_enabled = False
             self.minority_count = n_min
             self.total_size = n_min + n_maj
-
         else:
-            # обычная логика с cap на oversample
-            target_minority = int((self.target_ratio * n_maj) / (1 - self.target_ratio))
+            target_minority = int((self.target_ratio * n_maj)
+                                  / (1 - self.target_ratio))
             oversample_cap = int(n_min * self.max_oversample_factor)
-
-            self.minority_count = max(
-                n_min,                              # не undersample'ить
-                min(target_minority, oversample_cap)  # не oversample'ить больше cap
-            )
+            self.minority_count = max(n_min,
+                                      min(target_minority, oversample_cap))
             self.total_size = self.minority_count + n_maj
-
             if self.minority_count < target_minority:
-                actual_ratio = self.minority_count / self.total_size
+                actual = self.minority_count / self.total_size
                 print(f"[sampler] minority capped: {self.minority_count} "
-                      f"(target был {target_minority}, cap factor={self.max_oversample_factor}). "
-                      f"Фактический target_ratio={actual_ratio:.3f} вместо {self.target_ratio}")
+                      f"(target был {target_minority}, "
+                      f"cap factor={self.max_oversample_factor}). "
+                      f"Фактический target_ratio={actual:.3f}")
 
-        # max_samples / min_samples как раньше, только если балансировка включена
         if self.balance_enabled:
             if max_samples is not None:
                 if max_samples > self.total_size:
-                    warnings.warn(f"max_samples > total, {max_samples=}, {self.total_size=}")
+                    warnings.warn(f"max_samples > total")
                 else:
-                    print(f"total c {self.total_size} урезали до: {max_samples}")
+                    print(f"total урезали до: {max_samples}")
                     self.total_size = max_samples
                     self.minority_count = int(self.total_size * self.target_ratio)
-
             elif min_samples and self.total_size < min_samples:
-                print(f"min_samples: {self.total_size} увеличено до {min_samples}")
+                print(f"min_samples: увеличено до {min_samples}")
                 self.total_size = min_samples
                 self.minority_count = int(self.total_size * self.target_ratio)
 
         if n_min == 0:
-            warnings.warn(f"нет ни одного окна с меткой {self.minority_label}")
+            warnings.warn(f"нет окон с меткой {self.minority_label}")
         if n_maj == 0:
-            warnings.warn("нет ни одного окна с меткой мажоритарного класса")
+            warnings.warn("нет окон с меткой мажоритарного класса")
 
         print(f"[sampler] итог: minority={self.minority_count}, "
               f"majority={self.total_size - self.minority_count}, "
               f"total={self.total_size}, "
               f"balance={'ON' if self.balance_enabled else 'OFF'}, "
-              f"actual_frac_minority="
+              f"frac_minority="
               f"{self.minority_count / max(self.total_size, 1) * 100:.1f}%")
 
         self.seed = seed
         self.rng = None
 
-    # sample_count, __iter__, __len__ — без изменений
-
     def sample_count(self, array: np.ndarray, count: int) -> np.ndarray:
         if count < len(array):
             return self.rng.choice(array, count, replace=False)
         else:
-            if len(array) == 0: return array
+            if len(array) == 0:
+                return array
             reps, rem = divmod(count, len(array))
             reps_array = np.tile(array, reps)
             if rem:
@@ -609,21 +604,26 @@ class BalancedSampler(Sampler):
             self.rng.shuffle(reps_array)
             return reps_array
 
-
     def __iter__(self):
-
         wi = torch.utils.data.get_worker_info()
         base = self.seed if self.seed is not None else 0
         self.rng = np.random.default_rng(base + (wi.id if wi is not None else 0))
 
-        oversampled_minority = self.sample_count(self.minority_indices, self.minority_count)
-        oversampled_majority = self.sample_count( self.majority_indices, self.total_size - self.minority_count)
+        oversampled_minority = self.sample_count(self.minority_indices,
+                                                  self.minority_count)
+        oversampled_majority = self.sample_count(self.majority_indices,
+                                                  self.total_size - self.minority_count)
         combined = np.concatenate([oversampled_minority, oversampled_majority])
         self.rng.shuffle(combined)
 
-        print(f'sampler: num {self.majority_label}={len(oversampled_majority)}, num {self.minority_label}={len(oversampled_minority)}')
+        print(f'sampler: num {self.majority_label}={len(oversampled_majority)}, '
+              f'num {self.minority_label}={len(oversampled_minority)}')
         t = len(oversampled_majority) + len(oversampled_minority)
-        if t > 0: print(f'sampler: frac {self.majority_label}={len(oversampled_majority)/t*100:.2f}, frac {self.minority_label}={len(oversampled_minority)/t*100:.2f}')
+        if t > 0:
+            print(f'sampler: frac {self.majority_label}='
+                  f'{len(oversampled_majority)/t*100:.2f}, '
+                  f'frac {self.minority_label}='
+                  f'{len(oversampled_minority)/t*100:.2f}')
         return iter(combined)
 
     def __len__(self) -> int:
