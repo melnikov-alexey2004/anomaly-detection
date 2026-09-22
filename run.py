@@ -42,8 +42,8 @@ from model import (
 class Config:
     # ---------- данные ----------
     dataset: str = "bgl"                       # bgl | tbird | spirit | liberty
-    win_size: int = 200
-    step_size: int = 200
+    win_size: int = 199
+    step_size: int = 199
     anchor_step: int = 10
     batch_size: int = 16
     num_workers: int = 0
@@ -74,7 +74,7 @@ class Config:
     # ---------- Longformer ----------
     longformer_model_name: str = "allenai/longformer-base-4096"
     longformer_layers: int = 12                # 4..24
-    longformer_attention_window: int = 512     # 128..4096
+    longformer_attention_window: int = 50     # 128..4096 win_size + 1  кртаон размеру окна!!! todo:
 
     # ---------- агрегация ----------
     aggregate_layers: int = 4

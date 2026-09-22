@@ -376,6 +376,7 @@ class LogAnomalyModel(nn.Module):
                                                 dtype=own[name].dtype))
 
     def forward(self, log_embs, times, attention_mask):
+
         x = self.projector(log_embs)                              # [B,L,H]
         B, L, _ = x.shape
 
@@ -386,12 +387,18 @@ class LogAnomalyModel(nn.Module):
                               device=x.device)
             attention_mask = torch.cat([ones, attention_mask], dim=1)
 
+        original_len = attention_mask.shape[1]  # до вызова longformer
+
         lf_out = self.longformer(
             inputs_embeds=x,
             attention_mask=attention_mask,
             output_hidden_states=True,
         )
+
         hidden = lf_out.hidden_states
+        # Longformer паддит вход до кратного attention_window — режем обратно
+        hidden = tuple(h[:, :original_len, :] for h in hidden)
+        
         K = self.aggregator.k
 
         if self.use_cls:
