@@ -555,23 +555,52 @@ def save_trainable(model, optimizer, scheduler, epoch, global_step, save_dir):
 
 
 def load_adapter_into(model, adapter_dir: str):
-    """Загружает LoRA-адаптер по локальному пути (in-place, без пересоздания PeftModel)."""
-    if isinstance(model.longformer, PeftModel):
-        try:
-            model.longformer.load_adapter(adapter_dir, adapter_name="default")
-            model.longformer.set_adapter("default")
-        except Exception as e:
-            print(f"[load_adapter] load_adapter упал ({e}); fallback через PeftModel")
-            model.longformer = PeftModel.from_pretrained(
-                model.longformer.base_model, adapter_dir, is_trainable=True
-            )
-    else:
-        model.longformer = PeftModel.from_pretrained(
-            model.longformer, adapter_dir, is_trainable=True
+    """
+    Грузит LoRA-веса из локальной папки в СУЩЕСТВУЮЩИЙ PeftModel.
+    Модель не пересоздаётся, адаптер "default" остаётся тем же объектом.
+    """
+    import os
+    from peft import set_peft_model_state_dict
+    from safetensors.torch import load_file
+
+    if not os.path.isdir(adapter_dir):
+        raise FileNotFoundError(
+            f"adapter_dir не существует: {adapter_dir}"
         )
+
+    # читаем state dict адаптера
+    state = None
+    for fname in ("adapter_model.safetensors", "adapter_model.bin"):
+        path = os.path.join(adapter_dir, fname)
+        if os.path.exists(path):
+            state = (load_file(path) if fname.endswith(".safetensors")
+                     else torch.load(path, map_location="cpu"))
+            break
+    if state is None:
+        raise FileNotFoundError(
+            f"нет adapter_model.safetensors или adapter_model.bin в {adapter_dir}"
+        )
+
+    # загружаем веса в существующий адаптер "default"
+    result = set_peft_model_state_dict(model.longformer, state)
+    print(f"[load_adapter] loaded keys: {len(state)}")
+    if result is not None and hasattr(result, "missing_keys"):
+        if result.missing_keys:
+            print(f"[load_adapter] missing: {len(result.missing_keys)}")
+        if result.unexpected_keys:
+            print(f"[load_adapter] unexpected: {len(result.unexpected_keys)}")
+
+    # включаем адаптер и разморозить LoRA-параметры
+    if hasattr(model.longformer, "set_adapter"):
+        try:
+            model.longformer.set_adapter("default")
+        except Exception:
+            pass
+
     for n, p in model.longformer.named_parameters():
         if "lora_" in n:
             p.requires_grad_(True)
+
 
 
 # load_trainable удалён: resume-логика целиком реализована в run.py,
