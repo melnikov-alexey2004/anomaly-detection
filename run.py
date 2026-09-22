@@ -269,13 +269,32 @@ def train_loop(model, optimizer, scheduler, train_loader,
             optimizer.zero_grad()
             with autocast_ctx:
                 logits = model(log_embs, batch["times"], mask)
-            loss = criterion(logits.float(), y)
+            lloss = criterion(logits.float(), y)
+
+            # защита от NaN/Inf loss
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"[skip] NaN/Inf loss на шаге {global_step}")
+                optimizer.zero_grad()
+                continue
+
             loss.backward()
+
             if cfg.grad_clip:
                 torch.nn.utils.clip_grad_norm_(
                     [p for p in model.parameters() if p.requires_grad],
                     cfg.grad_clip,
                 )
+
+            # защита от NaN/Inf в градиентах
+            has_bad_grad = any(
+                p.grad is not None and (torch.isnan(p.grad).any() or torch.isinf(p.grad).any())
+                for p in model.parameters() if p.requires_grad
+            )
+            if has_bad_grad:
+                print(f"[skip] NaN/Inf grad на шаге {global_step}")
+                optimizer.zero_grad()
+                continue
+
             optimizer.step()
             scheduler.step()
 
@@ -623,7 +642,7 @@ def run(cfg: Config):
                       f"{run_path_in_repo}/final")
         upload_file(local_metrics_path, repo_id,
                     f"{run_path_in_repo}/metrics.pkl")
-        # объединённая история
+        # объединённая история с дедупликацией
         merged = "/content/metrics_history.pkl"
         merged_data = []
         try:
@@ -632,7 +651,18 @@ def run(cfg: Config):
                 merged_data = pickle.load(f)
         except Exception:
             pass
-        merged_data.extend(history)
+
+        # ключ = (run_tag, global_step, phase) — уникально идентифицирует запись
+        def _key(r):
+            return (r.get("run_tag"), r.get("global_step"), r.get("phase"))
+
+        seen = {_key(r) for r in merged_data}
+        new_records = [r for r in history if _key(r) not in seen]
+        print(f"[metrics_history] было {len(merged_data)}, "
+              f"новых {len(new_records)}, "
+              f"дубликатов пропущено {len(history) - len(new_records)}")
+
+        merged_data.extend(new_records)
         with open(merged, "wb") as f:
             pickle.dump(merged_data, f)
         upload_file(merged, repo_id, "metrics_history.pkl")

@@ -495,7 +495,7 @@ def evaluate(model, loader, device, criterion, autocast_ctx=None,
 
         with autocast_ctx:
             logits = model(log_embs, batch["times"], mask)
-        losses.append(criterion(logits.float(), y).item())
+        losses.append(criterion(logits.float(), y).item() if not torch.isnan(logits).any() else float("nan"))
         probs.append(torch.sigmoid(logits.float()).cpu())
         ys.append(y.cpu())
         n_seen += y.numel()
@@ -510,7 +510,21 @@ def evaluate(model, loader, device, criterion, autocast_ctx=None,
 
     p_prob = torch.cat(probs).numpy()
     y_true = torch.cat(ys).numpy().astype(int)
+
+    # отсеять NaN
+    valid = ~np.isnan(p_prob)
+    n_nan = int((~valid).sum())
+    if n_nan > 0:
+        print(f"[eval] {n_nan} NaN-предсказаний отброшено")
+
+    if valid.sum() == 0:
+        return {"loss": 0.0, "precision": 0.0, "recall": 0.0, "f1": 0.0,
+                "n_windows": 0, "n_pos": 0, "nan_count": n_nan}
+
+    p_prob = p_prob[valid]
+    y_true = y_true[valid]
     y_pred = (p_prob >= 0.5).astype(int)
+
     pr, rc, f1, _ = precision_recall_fscore_support(
         y_true, y_pred, average="binary", zero_division=0
     )
