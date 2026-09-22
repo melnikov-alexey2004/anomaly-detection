@@ -444,14 +444,18 @@ def autocast_context(cfg):
 
 @torch.no_grad()
 def evaluate(model, loader, device, criterion, autocast_ctx=None,
-             max_windows: typing.Optional[int] = None) -> dict:
+             max_windows: typing.Optional[int] = None, max_batches=None, desc="eval") -> dict:
     model.eval()
     losses, probs, ys = [], [], []
     n_seen = 0
     if autocast_ctx is None:
         autocast_ctx = contextlib.nullcontext()
 
-    for batch in loader:
+    pbar = tqdm(loader, desc=desc, leave=False)
+    for i, batch in enumerate(loader):
+        if max_batches is not None and i >= max_batches:
+            break
+
         if batch is None:
             continue
         log_embs = batch["log_embs"].to(device)
@@ -464,6 +468,8 @@ def evaluate(model, loader, device, criterion, autocast_ctx=None,
         probs.append(torch.sigmoid(logits.float()).cpu())
         ys.append(y.cpu())
         n_seen += y.numel()
+
+        pbar.set_postfix({"seen": n_seen})
         if max_windows is not None and n_seen >= max_windows:
             break
 

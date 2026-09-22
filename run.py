@@ -13,7 +13,7 @@ import pickle
 import typing
 import dataclasses
 import datetime as _dt
-
+from tqdm.auto import tqdm
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Sampler
@@ -409,12 +409,14 @@ def run(cfg: Config):
                     f"{run_path_in_repo}/config.json")
 
     # --- обучение ---
-    for epoch in range(start_epoch, cfg.num_epochs):
+    epochs_bar = tqdm(range(start_epoch, cfg.num_epochs), desc="training")
+    for epoch in epochs_bar:
         model.train()
         running, n_run = 0.0, 0
         t0 = time.time()
 
-        for step, batch in enumerate(train_loader):
+        pbar = tqdm(train_loader, desc=f"epoch {epoch}", leave=False)
+        for step, batch in enumerate(pbar):
             if batch is None:
                 continue
             log_embs = batch["log_embs"].to(device)
@@ -437,6 +439,13 @@ def run(cfg: Config):
             running += loss.item()
             n_run += 1
             global_step += 1
+
+            pbar.set_postfix({
+                "loss": f"{running / max(n_run, 1):.3f}",
+                "lr": f"{scheduler.get_last_lr()[0]:.2e}",
+            })
+            # if cfg.max_train_batches is not None and step >= cfg.max_train_batches:
+            #     break
 
             if cfg.metrics_log_every and (step + 1) % cfg.metrics_log_every == 0:
                 ev = evaluate(model, val_loader_small, device, criterion,
