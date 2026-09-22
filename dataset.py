@@ -366,11 +366,31 @@ class Tbird(Data):
         super().__init__(url, dataset_dir='tbird', use_in_colab=use_in_colab, window_size=window_size,
                          step_size=step_size, max_lines=max_lines)
 
-        log_format = '<Label> <Id> <Date> <Admin> <Month> <Day> <Time> <AdminAddr> <Content>'.split()
+        log_format = '<Label> <Id> <Date> <Admin> <Month> <Day> <Time> <AdminAddr> <Content>'.split()   #thunderbird  , spirit, liberty
         self.cnt_ind = log_format.index("<Content>")
 
         self.path_to_log_dir = os.path.join(self.extract_dir, self.dataset_dir)
         self.path_to_log = os.path.join(self.path_to_log_dir, self.dataset_dir + ".log")
+
+    def get_time_content_label(self, raw_log: str) -> tuple[typing.Optional[datetime.datetime],
+        str, int]:
+        res = super().get_time_content_label(raw_log)
+        if res[0] is not None: return res
+        s = raw_log.split()
+        label = 1
+        try:
+            if s[0] == "-":
+                label = 0
+            # формат: <Label> <Id> <Date> <Admin> <Month> <Day> <Time> <AdminAddr> <Content>
+            date_str = s[2]  # "2005.06.03"
+            time_str = s[6]  # "01:00:00"
+            dt = datetime.datetime.strptime(
+                f"{date_str} {time_str}", "%Y.%m.%d %H:%M:%S"
+            )
+            cnt = " ".join(s[self.cnt_ind:]) if len(s) > self.cnt_ind else ""
+        except Exception:
+            return None, "", 0
+        return dt, cnt, label
 
 
 class Spirit(Data):
@@ -386,6 +406,26 @@ class Spirit(Data):
         self.path_to_log_dir = os.path.join(self.extract_dir, self.dataset_dir)
         self.path_to_log = os.path.join(self.path_to_log_dir, self.dataset_dir + ".log")
 
+    def get_time_content_label(self, raw_log: str) -> tuple[typing.Optional[datetime.datetime],
+        str, int]:
+        res = super().get_time_content_label(raw_log)
+        if res[0] is not None: return res
+        s = raw_log.split()
+        label = 1
+        try:
+            if s[0] == "-":
+                label = 0
+            # формат: <Label> <Id> <Date> <Admin> <Month> <Day> <Time> <AdminAddr> <Content>
+            date_str = s[2]  # "2005.06.03"
+            time_str = s[6]  # "01:00:00"
+            dt = datetime.datetime.strptime(
+                f"{date_str} {time_str}", "%Y.%m.%d %H:%M:%S"
+            )
+            cnt = " ".join(s[self.cnt_ind:]) if len(s) > self.cnt_ind else ""
+        except Exception:
+            return None, "", 0
+        return dt, cnt, label
+
 class Liberty(Data):
     def __init__(self, window_size:int, step_size:int, max_lines:float=math.inf,
                  use_in_colab: bool = True):
@@ -398,6 +438,26 @@ class Liberty(Data):
 
         self.path_to_log_dir = os.path.join(self.extract_dir, self.dataset_dir)
         self.path_to_log = os.path.join(self.path_to_log_dir, self.dataset_dir + ".log")
+
+    def get_time_content_label(self, raw_log: str) -> tuple[typing.Optional[datetime.datetime],
+        str, int]:
+        res = super().get_time_content_label(raw_log)
+        if res[0] is not None: return res
+        s = raw_log.split()
+        label = 1
+        try:
+            if s[0] == "-":
+                label = 0
+            # формат: <Label> <Id> <Date> <Admin> <Month> <Day> <Time> <AdminAddr> <Content>
+            date_str = s[2]  # "2005.06.03"
+            time_str = s[6]  # "01:00:00"
+            dt = datetime.datetime.strptime(
+                f"{date_str} {time_str}", "%Y.%m.%d %H:%M:%S"
+            )
+            cnt = " ".join(s[self.cnt_ind:]) if len(s) > self.cnt_ind else ""
+        except Exception:
+            return None, "", 0
+        return dt, cnt, label
 
 
 import numpy as np
@@ -518,40 +578,3 @@ class BalancedSampler(Sampler):
 
     def __len__(self) -> int:
         return self.total_size
-
-
-def make_collate_fn(encode_fn, jasper_batch):
-    """
-    encode_fn: list[str] -> Tensor [*, D]
-    Окно (list[str]) кодируется чанками по jasper_batch строк,
-    чтобы не улететь по памяти на длинных окнах.
-    """
-    def collate(batch):
-        windows, times_list, labels = [], [], []
-        for window, window_times, _raws, label in batch:
-            if len(window) == 0:
-                continue
-            chunks = [window[i:i + jasper_batch]
-                      for i in range(0, len(window), jasper_batch)]
-            emb = torch.cat([encode_fn(c) for c in chunks], dim=0)  # [WS, D]
-            windows.append(emb)
-            times_list.append(window_times)
-            labels.append(float(label))
-
-        max_len = max(e.shape[0] for e in windows)
-        D = windows[0].shape[1]
-
-        padded = torch.zeros(len(windows), max_len, D, dtype=torch.float32)
-        mask   = torch.zeros(len(windows), max_len, dtype=torch.long)
-        for i, e in enumerate(windows):
-            n = e.shape[0]
-            padded[i, :n] = e
-            mask[i, :n]   = 1
-
-        return {
-            "log_embs": padded,                            # [B, L, D]
-            "attention_mask": mask,                        # [B, L]
-            "times": times_list,                           # list[list[datetime]]
-            "labels": torch.tensor(labels, dtype=torch.float32),
-        }
-    return collate

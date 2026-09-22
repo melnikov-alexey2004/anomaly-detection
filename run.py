@@ -136,17 +136,25 @@ def cfg_to_json(cfg: Config) -> str:
 # ============================================================
 
 class FilteredSampler(Sampler):
-    def __init__(self, base: Sampler, max_start: int):
+    def __init__(self, base, max_start: int):
         self.base = base
         self.max_start = max_start
+        self._indices = None
+
+    def _materialize(self):
+        if self._indices is None:
+            self._indices = np.array(
+                [int(i) for i in self.base if int(i) < self.max_start],
+                dtype=np.int64,
+            )
 
     def __iter__(self):
-        for idx in self.base:
-            if int(idx) < self.max_start:
-                yield int(idx)
+        self._materialize()
+        yield from self._indices.tolist()
 
     def __len__(self):
-        return len(self.base)
+        self._materialize()
+        return len(self._indices)
 
 
 class LimitedIterable(torch.utils.data.IterableDataset):
@@ -215,7 +223,7 @@ def download_folder(repo_id: str, path_in_repo: str, local_dir: str):
     snapshot_download(
         repo_id=repo_id,
         repo_type="model",
-        allow_patterns=[f"{path_in_repo}/*"],
+        allow_patterns=[f"{path_in_repo}/**"],
         local_dir=local_dir,
     )
 
@@ -227,6 +235,105 @@ def download_folder(repo_id: str, path_in_repo: str, local_dir: str):
 _DATASET_CLS = {"bgl": BGL, "tbird": Tbird, "spirit": Spirit,
                 "liberty": Liberty}
 
+def train_loop(model, optimizer, scheduler, train_loader,
+               val_loader_small, val_loader_full, criterion, cfg,
+               device, autocast_ctx, line_cache, append_metric, history,
+               start_epoch: int, global_step: int):
+    """Один проход обучения. Возвращает global_step."""
+    epochs_bar = tqdm.trange(start_epoch, start_epoch + cfg.num_epochs,
+                             desc="training")
+    for epoch in epochs_bar:
+        model.train()
+        running, n_run = 0.0, 0
+        t0 = time.time()
+
+        pbar = tqdm.tqdm(train_loader, desc=f"epoch {epoch}", leave=False)
+        for step, batch in enumerate(pbar):
+            if batch is None:
+                continue
+            log_embs = batch["log_embs"].to(device)
+            mask     = batch["attention_mask"].to(device)
+            y        = batch["labels"].to(device)
+
+            optimizer.zero_grad()
+            with autocast_ctx:
+                logits = model(log_embs, batch["times"], mask)
+            loss = criterion(logits.float(), y)
+            loss.backward()
+            if cfg.grad_clip:
+                torch.nn.utils.clip_grad_norm_(
+                    [p for p in model.parameters() if p.requires_grad],
+                    cfg.grad_clip,
+                )
+            optimizer.step(); scheduler.step()
+
+            running += loss.item(); n_run += 1; global_step += 1
+            pbar.set_postfix({
+                "loss": f"{running / max(n_run, 1):.3f}",
+                "lr": f"{scheduler.get_last_lr()[0]:.2e}",
+            })
+
+            if cfg.metrics_log_every and (step + 1) % cfg.metrics_log_every == 0:
+                ev = evaluate(model, val_loader_small, device, criterion,
+                              autocast_ctx=autocast_ctx,
+                              max_windows=cfg.eval_max_windows)
+                append_metric({
+                    "run_tag": cfg.run_tag, "epoch": epoch,
+                    "global_step": global_step, "phase": "intra_epoch",
+                    "train_loss": running / max(n_run, 1), "eval": ev,
+                    "train_ratio": cfg.train_ratio,
+                    "eval_start_ratio": cfg.eval_start_ratio,
+                    "elapsed_sec": time.time() - t0,
+                })
+                print(f"[e{epoch} s{global_step}] "
+                      f"train={running/max(n_run,1):.4f} "
+                      f"f1={ev['f1']:.4f} P={ev['precision']:.3f} "
+                      f"R={ev['recall']:.3f} n={ev['n_windows']}")
+                model.train()
+
+        ev = evaluate(model, val_loader_small, device, criterion,
+                      autocast_ctx=autocast_ctx,
+                      max_windows=cfg.eval_max_windows)
+        append_metric({
+            "run_tag": cfg.run_tag, "epoch": epoch,
+            "global_step": global_step, "phase": "end_of_epoch",
+            "train_loss": running / max(n_run, 1), "eval": ev,
+            "train_ratio": cfg.train_ratio,
+            "eval_start_ratio": cfg.eval_start_ratio,
+            "elapsed_sec": time.time() - t0,
+        })
+        print(f"[end e{epoch}] f1={ev['f1']:.4f} "
+              f"P={ev['precision']:.3f} R={ev['recall']:.3f} "
+              f"n={ev['n_windows']} cache: {line_cache.stats()}")
+
+        local_ckpt = f"/content/ckpt_{cfg.run_tag}_e{epoch}"
+        save_trainable(model, optimizer, scheduler, epoch + 1,
+                       global_step, local_ckpt)
+        if cfg.push_to_hub and cfg.hub_repo_id:
+            upload_folder(local_ckpt, cfg.hub_repo_id,
+                          f"runs/{cfg.run_tag}/epoch_{epoch:02d}")
+            upload_folder(os.path.join(local_ckpt, "adapter"),
+                          cfg.hub_repo_id,
+                          f"runs/{cfg.run_tag}/adapter")
+            upload_file(os.path.join(local_ckpt, "train_state.pt"),
+                        cfg.hub_repo_id,
+                        f"runs/{cfg.run_tag}/train_state.pt")
+        print(f"[save] epoch {epoch} → {local_ckpt}")
+
+    if cfg.final_full_eval:
+        ev = evaluate(model, val_loader_full, device, criterion,
+                      autocast_ctx=autocast_ctx, max_windows=None)
+        append_metric({
+            "run_tag": cfg.run_tag,
+            "epoch": start_epoch + cfg.num_epochs - 1,
+            "global_step": global_step, "phase": "final_full",
+            "eval": ev, "train_ratio": cfg.train_ratio,
+            "eval_start_ratio": cfg.eval_start_ratio,
+        })
+        print(f"[final full eval] f1={ev['f1']:.4f} "
+              f"P={ev['precision']:.3f} R={ev['recall']:.3f} "
+              f"n={ev['n_windows']} (pos={ev['n_pos']})")
+    return global_step
 
 def run(cfg: Config):
     # --- seed ---
@@ -296,7 +403,7 @@ def run(cfg: Config):
         ds, target_ratio=cfg.target_ratio, seed=cfg.seed,
     )
     train_sampler = FilteredSampler(
-        base_sampler, max_start=min(train_limit, eval_start_line),
+        base_sampler, max_start=min(train_limit, eval_start_line - cfg.win_size),
     )
     train_loader = DataLoader(
         ds, batch_size=cfg.batch_size, sampler=train_sampler,
@@ -539,4 +646,11 @@ def run(cfg: Config):
         upload_file(merged, repo_id, "metrics_history.pkl")
         print(f"[hf] done → https://huggingface.co/{repo_id}")
 
-    return model
+    return {
+        "model": model, "optimizer": optimizer, "scheduler": scheduler,
+        "train_loader": train_loader,
+        "val_loader_small": val_loader_small, "val_loader_full": val_loader_full,
+        "criterion": criterion, "autocast_ctx": autocast_ctx,
+        "line_cache": line_cache, "history": history,
+        "global_step": global_step, "append_metric": append_metric,
+    }

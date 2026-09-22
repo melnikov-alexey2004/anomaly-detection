@@ -398,7 +398,7 @@ class LogAnomalyModel(nn.Module):
         hidden = lf_out.hidden_states
         # Longformer паддит вход до кратного attention_window — режем обратно
         hidden = tuple(h[:, :original_len, :] for h in hidden)
-        
+
         K = self.aggregator.k
 
         if self.use_cls:
@@ -459,7 +459,7 @@ def evaluate(model, loader, device, criterion, autocast_ctx=None,
         autocast_ctx = contextlib.nullcontext()
 
     pbar = tqdm.tqdm(loader, desc=desc, leave=False)
-    for i, batch in enumerate(loader):
+    for i, batch in enumerate(pbar):
         if max_batches is not None and i >= max_batches:
             break
 
@@ -517,9 +517,14 @@ def save_trainable(model, optimizer, scheduler, epoch, global_step, save_dir):
 
 
 def load_adapter_into(model, adapter_dir: str):
-    """Загружает LoRA-адаптер в существующий PeftModel."""
-    model.longformer.load_adapter(adapter_dir, adapter_name="default")
-    model.longformer.set_adapter("default")
+    from peft import PeftModel
+    if isinstance(model.longformer, PeftModel):
+        model.longformer.load_adapter(adapter_dir, adapter_name="default")
+        model.longformer.set_adapter("default")
+    else:
+        model.longformer = PeftModel.from_pretrained(
+            model.longformer, adapter_dir, is_trainable=True
+        )
     for n, p in model.longformer.named_parameters():
         if "lora_" in n:
             p.requires_grad_(True)
