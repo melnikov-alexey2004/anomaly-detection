@@ -111,6 +111,14 @@ class Config:
     sampler_max_oversample: float = 10.0
     sampler_min_minority: int = 50
 
+    # режим тренировки при continue_training
+    train_mode: str = "all"  # "all" | "new_only" | "mixed"
+    mixed_prev_fraction: float = 0.1  # доля старого диапазона для "mixed"
+    # "all" — учиться на всём [0, train_limit) (текущее поведение);
+    #
+    # "new_only" — только на [prev_limit, new_limit);
+    #
+    # "mixed" — на [(1-f)*prev_limit, new_limit) — 90% нового + 10% старого.
     # Hub
     push_to_hub: bool = True
     hub_repo_id: typing.Optional[str] = None
@@ -140,16 +148,18 @@ def cfg_to_json(cfg: Config) -> str:
 # ============================================================
 
 class FilteredSampler(Sampler):
-    """Отсекает индексы >= max_start. Честная __len__."""
-    def __init__(self, base: Sampler, max_start: int):
+    """Отсекает индексы вне [min_start, max_start). Честная __len__."""
+    def __init__(self, base: Sampler, max_start: int, min_start: int = 0):
         self.base = base
         self.max_start = max_start
+        self.min_start = min_start
         self._indices: typing.Optional[np.ndarray] = None
 
     def _materialize(self):
         if self._indices is None:
             self._indices = np.asarray(
-                [int(i) for i in self.base if int(i) < self.max_start],
+                [int(i) for i in self.base
+                 if self.min_start <= int(i) < self.max_start],
                 dtype=np.int64,
             )
 
@@ -401,12 +411,18 @@ def _build_loaders(ds, val_ds, cfg, line_cache):
 
 
 def _build_train_loader(ds, eval_start_line, cfg, line_cache,
-                        base_sampler=None):
+                        base_sampler=None, prev_train_limit=None):
     """
     Если base_sampler передан — переиспользуем (экономит минуты).
+
+    prev_train_limit:
+        None  — учимся на всём [0, train_limit)  (режим "all");
+        int   — учимся на [prev_train_limit, train_limit)  (режимы "new_only" / "mixed").
+
     Возвращает (train_loader, base_sampler).
     """
     train_limit = int(ds.total_lines * cfg.train_ratio)
+    safe_max = max(0, min(train_limit, eval_start_line - cfg.win_size))
 
     if base_sampler is None:
         print("[sampler] строим BalancedSampler (может занять минуты)...")
@@ -419,17 +435,26 @@ def _build_train_loader(ds, eval_start_line, cfg, line_cache,
     else:
         print("[sampler] переиспользуем существующий BalancedSampler")
 
-    safe_max = max(0, min(train_limit, eval_start_line - cfg.win_size))
-    train_sampler = FilteredSampler(base_sampler, max_start=safe_max)
+    # нижняя граница диапазона
+    safe_min = 0
+    if prev_train_limit is not None and prev_train_limit > 0:
+        safe_min = min(prev_train_limit, safe_max)
+        print(f"[loader] РЕЖИМ: только новые данные, "
+              f"окна в [{safe_min}, {safe_max})")
+
+    train_sampler = FilteredSampler(
+        base_sampler, max_start=safe_max, min_start=safe_min,
+    )
     collate = make_collate_fn(line_cache)
     train_loader = DataLoader(
         ds, batch_size=cfg.batch_size, sampler=train_sampler,
         collate_fn=collate, num_workers=cfg.num_workers,
     )
     print(f"[loader] train_ratio={cfg.train_ratio} → "
-          f"train_limit={train_limit} safe_max={safe_max} "
-          f"окон={len(train_sampler)}")
+          f"train_limit={train_limit} safe_min={safe_min} "
+          f"safe_max={safe_max} окон={len(train_sampler)}")
     return train_loader, base_sampler
+
 
 
 def _build_scheduler(optimizer, total_steps, cfg):
@@ -716,12 +741,34 @@ def continue_training(state: dict, cfg: Config) -> dict:
     else:
         repo_id = None
 
-    # train_loader
+    # --- определяем prev_train_limit для режимов new_only / mixed ---
+    prev_train_limit = None
+    train_mode = getattr(cfg, "train_mode", "all")
+
+    if train_mode != "all" and cfg.train_ratio != state.get("train_ratio"):
+        prev_ratio = state.get("train_ratio", 0.0)
+        if prev_ratio > 0:
+            prev_train_limit = int(ds.total_lines * prev_ratio)
+
+            if train_mode == "mixed":
+                # сдвигаем нижнюю границу назад, чтобы захватить хвост старого
+                frac = getattr(cfg, "mixed_prev_fraction", 0.1)
+                prev_train_limit = int(prev_train_limit * (1.0 - frac))
+                print(f"[continue] train_mode=mixed, "
+                      f"prev_train_limit={prev_train_limit} "
+                      f"(было {int(ds.total_lines * prev_ratio)}, "
+                      f"сдвинуто на {frac * 100:.0f}% назад)")
+            else:  # new_only
+                print(f"[continue] train_mode=new_only, "
+                      f"prev_train_limit={prev_train_limit}")
+
+    # --- train_loader ---
     if cfg.train_ratio != state.get("train_ratio") \
-       or cfg.batch_size != state["cfg"].batch_size:
+            or cfg.batch_size != state["cfg"].batch_size:
         train_loader, base_sampler = _build_train_loader(
             ds, eval_start_line, cfg, line_cache,
             base_sampler=state.get("base_sampler"),
+            prev_train_limit=prev_train_limit,
         )
         state["base_sampler"] = base_sampler
     else:
