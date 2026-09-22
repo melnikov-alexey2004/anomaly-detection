@@ -1,4 +1,5 @@
-from torch.utils.data import Dataset, DataLoader, Sampler
+import torch
+from torch.utils.data import Dataset, DataLoader, Sampler, IterableDataset
 import os
 import subprocess
 import shutil
@@ -185,6 +186,8 @@ def replace_patterns(text):
     text = combined_pattern.sub(text, "<*>")
     return text
 
+import io
+
 class SuperComputerDataset(Dataset):
     def __init__(
             self,
@@ -210,10 +213,11 @@ class SuperComputerDataset(Dataset):
         self.line_positions: list[int] = []  # позиции строк 0, n, 2n, ...
         self.labels_list: list[int] = []  # метка для каждой строки
         self.total_lines = 0
-        self._num_samples = 0
+        self._num_samples: int = 0
 
         self._build_index()
         self.labels: np.ndarray[tuple[int], np.dtype[np.int8]] = np.asarray(self.labels_list, dtype=np.int8)
+        self.file: typing.Optional[io.BufferedReader] = None
 
     def _build_index(self) -> None:
         line_idx = 0
@@ -250,31 +254,35 @@ class SuperComputerDataset(Dataset):
             # 0d or scalar array
             start_line = start_line.item()
 
-        if start_line < 0 or start_line + self.window_size > self.total_lines:
+        if self.file is None:
+            self.file = open(self.filepath, "rb")
+        self.file = typing.cast(io.BufferedReader, self.file)
+
+        if start_line < 0 or start_line >= self.total_lines:
+            # последнее окно может быть не полным
             raise IndexError(start_line)
 
         anchor_idx = start_line // self.n
         anchor_line = anchor_idx * self.n
         skip_lines = start_line - anchor_line
 
-        with open(self.filepath, "rb") as f:
-            f.seek(self.line_positions[anchor_idx])
-            for _ in range(skip_lines):
-                if not f.readline():
-                    return [], [], [], 0
-            window = []
-            window_times = []
-            window_raws = []
-            for _ in range(self.window_size):
-                raw = f.readline()
-                if not raw:
-                    break
-                raw_log = raw.decode("latin-1", errors="replace")
-                dt, cnt, label = self.source.get_time_content_label(raw_log)
-                cnt = replace_patterns(cnt)
-                window_times.append(dt)
-                window.append(cnt)
-                window_raws.append(raw_log)
+        self.file.seek(self.line_positions[anchor_idx])
+        for _ in range(skip_lines):
+            if not self.file.readline():
+                return [], [], [], 0
+        window = []
+        window_times = []
+        window_raws = []
+        for _ in range(self.window_size):
+            raw = self.file.readline()
+            if not raw:
+                break
+            raw_log = raw.decode("latin-1", errors="replace")
+            dt, cnt, label = self.source.get_time_content_label(raw_log)
+            cnt = replace_patterns(cnt)
+            window_times.append(dt)
+            window.append(cnt)
+            window_raws.append(raw_log)
 
         window_label = max(self.labels[start_line: start_line + len(window)])
         return window, window_times, window_raws, window_label
@@ -282,6 +290,36 @@ class SuperComputerDataset(Dataset):
     def __len__(self):
         return max(0, self.total_lines - self.window_size + 1)
 
+import math
+import typing
+from torch.utils.data import IterableDataset
+
+class EvaluationDataset(IterableDataset):
+    def __init__(self, train_dataset: SuperComputerDataset):
+        self.train_dataset = train_dataset
+        self.window_size = train_dataset.window_size
+        self.step_size = train_dataset.step_size
+        self.total_lines = train_dataset.total_lines
+
+        n_train = train_dataset._num_samples
+        if n_train <= 0:
+            self.start_line = 0
+        else:
+            last_train_start = (n_train - 1) * self.step_size
+            self.start_line = min(last_train_start + self.window_size, self.total_lines)
+
+        self.end_line = self.total_lines
+
+    def __len__(self):
+        last_possible_start = self.end_line - self.window_size
+        if last_possible_start < self.start_line:
+            return 0
+        return (last_possible_start - self.start_line) // self.step_size + 1
+
+    def __iter__(self):
+        last_possible_start = self.end_line - self.window_size
+        for start in range(self.start_line, last_possible_start + 1, self.step_size):
+            yield self.train_dataset[start]
 
 import datetime
 import typing
@@ -365,64 +403,120 @@ class Liberty(Data):
 import numpy as np
 
 class BalancedSampler(Sampler):
-    def __init__(self, dataset: SuperComputerDataset, target_ratio=0.3, max_samples=None, min_samples=50000):
-        self.labels = dataset.labels # np.ndarray
+    def __init__(self, dataset: SuperComputerDataset, target_ratio=0.3, max_samples=None, min_samples=1000,
+                 seed: typing.Optional[int]=None):
         self.dataset = dataset
         self.target_ratio = target_ratio
         self.max_samples = max_samples
         self.min_samples = min_samples  # only if max_samples is None, min_samples can work
 
-        self.normal_indices = np.where(self.labels == 0)[0]
-        self.anomalous_indices = np.where(self.labels == 1)[0]
+        self.W = dataset.window_size
+        self.N = dataset.total_lines
+        self.step_size = dataset.step_size
+        labels = self.dataset.labels
 
-        self.minority_indices = (
-            self.anomalous_indices if len(self.anomalous_indices) < len(self.normal_indices)
-            else self.normal_indices
-        )
-        self.majority_indices = (
-            self.normal_indices if self.minority_indices is self.anomalous_indices
-            else self.anomalous_indices
-        )
+        all_starts = np.arange(0, self.N - self.W + 1, self.step_size, dtype=np.int64)
+        prefix = np.zeros(self.N + 1, dtype=np.int64)
+        prefix[1:] = np.cumsum(labels)
+        has_anom = (prefix[all_starts + self.W] - prefix[all_starts]) > 0
+        self.normal_indices = all_starts[~has_anom]
+        self.anomalous_indices = all_starts[has_anom]
+
+        # self.normal_indices = np.where(self.labels == 0)[0]
+        # self.anomalous_indices = np.where(self.labels == 1)[0]
+
+
+        if len(self.anomalous_indices) <= len(self.normal_indices):
+            self.minority_label, self.majority_label = "abnormal", "normal"
+            self.minority_indices, self.majority_indices = self.anomalous_indices, self.normal_indices
+        else:
+            self.minority_label, self.majority_label = "normal", "abnormal"
+            self.minority_indices, self.majority_indices = self.normal_indices, self.anomalous_indices
+
+        print(f'sampler: a={len(self.anomalous_indices)}, n={len(self.normal_indices)}')
+        t = len(self.anomalous_indices) + len(self.normal_indices)
+        if t > 0: print(f'sampler: frac_a={len(self.anomalous_indices)/t*100:.2f}%, frac_n={len(self.normal_indices)/t*100:.2f}%')
 
         self.minority_count = max(int((self.target_ratio * len(self.majority_indices)) / (1 - self.target_ratio)), len(self.minority_indices))
         self.total_size = self.minority_count + len(self.majority_indices)
 
-        if self.max_samples is not None:
-            if self.max_samples > self.total_size:
-                raise ValueError(
-            f"The hyperparameter 'max_samples' should smaller than the samples in the dataset.")
-            self.total_size = self.max_samples
+        if len(self.minority_indices) == 0:
+            warnings.warn(f"нет ни одного окна с меткой {self.minority_label}")
 
-        elif self.total_size < self.min_samples:
-            self.total_size = self.min_samples
+        if len(self.majority_indices) == 0:
+            warnings.warn(f"нет ни одного окна с меткой {self.majority_label}")
+
+        if max_samples is not None:
+            if max_samples > self.total_size:
+                warnings.warn(f"max_samples > total, {max_samples=}, {self.total_size=}")
+                warnings.warn(f"total осталось прежним")
+                print(f"total c {self.total_size} остался как и был при {max_samples=}")
+
+            else:
+                # total >= max_samples
+                # соханяем  нужную долю
+                print(f"total c {self.total_size} урезали до: {max_samples}")
+                self.total_size = max_samples
+                self.minority_count = int(self.total_size * self.target_ratio)
+
+        elif min_samples and self.total_size < min_samples:
+            # если дополняем до нужного числа объектов то доля будет tar_rat
+            print(f"min_samples: {self.total_size} увеличено до {self.min_samples}")
+            self.total_size = min_samples
+            self.minority_count = int(self.total_size * self.target_ratio)
+            # если бы требовалось покрыть все минорные за одну эпоху
+            # self.minority_count = min(
+            #     self.total_size,
+            #     max(int(self.total_size * self.target_ratio), len(self.minority_indices)),
+            # )
+
+        if len(self.minority_indices) == 0:
+            # только мажоритарный класс
+            warnings.warn("только мажоритарный класс")
+            self.minority_count = 0
+            self.total_size = len(self.majority_indices)
+        if len(self.majority_indices) == 0:
+            # только минорный класс
+            warnings.warn("только минорный класс")
+            self.minority_count = len(self.minority_indices)
+            self.total_size = len(self.minority_indices)
+
+        self.seed = seed
+        self.rng = None
+
+    def sample_count(self, array: np.ndarray, count: int) -> np.ndarray:
+        if count < len(array):
+            return self.rng.choice(array, count, replace=False)
+        else:
+            if len(array) == 0: return array
+            reps, rem = divmod(count, len(array))
+            reps_array = np.tile(array, reps)
+            if rem:
+                reps_array = np.concatenate([
+                    reps_array,
+                    self.rng.choice(array, rem, replace=False),
+                ])
+            self.rng.shuffle(reps_array)
+            return reps_array
 
 
     def __iter__(self):
-        oversampled_minority = np.tile(self.minority_indices, int(self.minority_count / len(self.minority_indices)))
-        oversampled_minority_ = np.random.choice(
-            self.minority_indices,
-            self.minority_count - len(oversampled_minority),
-            replace=False
-        )
-        combined_indices = np.concatenate([self.majority_indices, oversampled_minority, oversampled_minority_])
-        if len(combined_indices) > self.total_size:
-            combined_indices = np.random.choice(
-                combined_indices,
-                self.total_size,
-                replace=False
-            )
-        else:
-            combined_indices = np.tile(combined_indices, int(self.total_size/len(combined_indices)))
-            combined_indices_ = np.random.choice(
-                combined_indices,
-                self.total_size-len(combined_indices),
-                replace=False
-            )
-            combined_indices = np.concatenate([combined_indices, combined_indices_])
-            np.random.shuffle(combined_indices)
-        return iter(combined_indices)
 
-    def __len__(self):
+        wi = torch.utils.data.get_worker_info()
+        base = self.seed if self.seed is not None else 0
+        self.rng = np.random.default_rng(base + (wi.id if wi is not None else 0))
+
+        oversampled_minority = self.sample_count(self.minority_indices, self.minority_count)
+        oversampled_majority = self.sample_count( self.majority_indices, self.total_size - self.minority_count)
+        combined = np.concatenate([oversampled_minority, oversampled_majority])
+        self.rng.shuffle(combined)
+
+        print(f'sampler: num {self.majority_label}={len(oversampled_majority)}, num {self.minority_label}={len(oversampled_minority)}')
+        t = len(oversampled_majority) + len(oversampled_minority)
+        if t > 0: print(f'sampler: frac {self.majority_label}={len(oversampled_majority)/t*100:.2f}, frac {self.minority_label}={len(oversampled_minority)/t*100:.2f}')
+        return iter(combined)
+
+    def __len__(self) -> int:
         return self.total_size
 
 
@@ -485,7 +579,7 @@ class JitterBalancedSampler(Sampler):
                 print(f"max_samples: {total=}")
 
             need_min = int(target_ratio * total)
-        elif total < min_samples:
+        elif min_samples and total < min_samples:
             # если дополняем до нужного числа объектов то доля будет tar_rat
             # и дополняем только аном. окнами
             total = min_samples
@@ -563,3 +657,39 @@ class JitterBalancedSampler(Sampler):
     def print_count(self, n, a, phrase=''):
         print(f'{phrase}: {n=}, {a=}, общее {n+a=}')
         print(f'их доли: frac_n={n / (n + a) * 100:.3f}, frac_a={a / (n + a) * 100:.3f}')
+
+def make_collate_fn(encode_fn, jasper_batch):
+    """
+    encode_fn: list[str] -> Tensor [*, D]
+    Окно (list[str]) кодируется чанками по jasper_batch строк,
+    чтобы не улететь по памяти на длинных окнах.
+    """
+    def collate(batch):
+        windows, times_list, labels = [], [], []
+        for window, window_times, _raws, label in batch:
+            if len(window) == 0:
+                continue
+            chunks = [window[i:i + jasper_batch]
+                      for i in range(0, len(window), jasper_batch)]
+            emb = torch.cat([encode_fn(c) for c in chunks], dim=0)  # [WS, D]
+            windows.append(emb)
+            times_list.append(window_times)
+            labels.append(float(label))
+
+        max_len = max(e.shape[0] for e in windows)
+        D = windows[0].shape[1]
+
+        padded = torch.zeros(len(windows), max_len, D, dtype=torch.float32)
+        mask   = torch.zeros(len(windows), max_len, dtype=torch.long)
+        for i, e in enumerate(windows):
+            n = e.shape[0]
+            padded[i, :n] = e
+            mask[i, :n]   = 1
+
+        return {
+            "log_embs": padded,                            # [B, L, D]
+            "attention_mask": mask,                        # [B, L]
+            "times": times_list,                           # list[list[datetime]]
+            "labels": torch.tensor(labels, dtype=torch.float32), #todo: зачем float для меток 0,1 bce with logtis loss!!!
+        }
+    return collate
