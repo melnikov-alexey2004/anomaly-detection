@@ -432,9 +432,11 @@ class JitterBalancedSampler(Sampler):
             dataset: SuperComputerDataset,
             target_ratio=0.3,
             max_samples=None,
-            min_samples=50_000,
+            min_samples=1000,
             seed=None,
+            do_random_shift_on_abnormal:bool=True,
     ):
+        self.do_random_shift_on_abnormal = do_random_shift_on_abnormal
         self.dataset = dataset
         self.W = dataset.window_size
         self.N = dataset.total_lines
@@ -449,9 +451,9 @@ class JitterBalancedSampler(Sampler):
         prefix[1:] = np.cumsum(labels)
         has_anom = (prefix[all_starts + self.W] - prefix[all_starts]) > 0
         self.normal_starts = all_starts[~has_anom]
-        # self.abnormal_starts = all_starts[has_anom]
 
-        self.print_count(len(self.normal_starts), has_anom.sum(), "доля")
+        if not self.do_random_shift_on_abnormal:
+            self.abnormal_starts = all_starts[has_anom]
 
         if len(self.anomaly_lines) == 0:
             raise ValueError("Нет аномалий в датасете")
@@ -460,55 +462,60 @@ class JitterBalancedSampler(Sampler):
 
         N_norm = len(self.normal_starts)
 
-        N_min = len(self.anomaly_lines)  # не считается по правильным стартовым позициям из-за аугментации через сдвиг
-        self.print_count(N_norm, N_min, "a показывает колво возможных  стартовых позиций для аномального окна")
+        # N_min = len(self.anomaly_lines)  # не считается по правильным стартовым позициям из-за аугментации через сдвиг
+        N_min = has_anom.sum() # число аном окон в прав позициях
+        self.print_count(N_norm ,N_min, "a,n - число окон. (аном окна стартуют не в случ позициях)")
 
         # сколько аномальных сэмплов нужно для того чтобы достичь доли target_ratio
         need_min = int(target_ratio * N_norm / (1 - target_ratio))
         need_min = max(need_min, N_min) # не меньше чем было до этого
         total = need_min + N_norm
-        self.print_count(N_norm, need_min, "n = число норм окон. a = число анорм. окон после оверсемплинга")
+        self.print_count(N_norm, need_min, f"{total=} число окон после оверсемплинга. (аном окна стартуют не в случ позициях)")
 
         if max_samples is not None:
             # всегда выполнено что для минорного класса (аномальных) >= tar_rat
             if max_samples > total:
                 # доля 1
-                raise ValueError("max_samples > total")
-            total = max_samples
-            if N_min > total:
-                print(f'после установки {max_samples=} в выборке остались только аномальные для всей эпохи')
-            need_min = max(int(target_ratio * total), min(N_min, total))
+                warnings.warn(f"max_samples > total, {max_samples=}, {total=}")
+                warnings.warn(f"total осталось прежним")
+
+            else:
+                # total >= max_samples
+                total = max_samples
+                print(f"max_samples: {total=}")
+
+            need_min = int(target_ratio * total)
         elif total < min_samples:
             # если дополняем до нужного числа объектов то доля будет tar_rat
             # и дополняем только аном. окнами
             total = min_samples
-            need_min = max(int(target_ratio * total), N_min)
+            need_min = int(target_ratio * total)
+            print(f"min_samples: {total=}")
 
         self.normal_count = total - need_min
         self.minority_count = need_min
         self.total_size = total
         self.print_count(self.normal_count, self.minority_count,
-                         f"после применения ограничителей на размер датасета")
+                         f"после применения {min_samples=}, {max_samples=} на размер датасета")
         self.rng = np.random.default_rng(seed)
+
+    def sample_count(self, array: np.ndarray, count: int) -> np.ndarray:
+        if count < len(array):
+            return self.rng.choice(array, count, replace=False)
+        else:
+            reps, rem = divmod(count, len(array))
+            reps_array = np.tile(array, reps)
+            if rem:
+                reps_array = np.concatenate([
+                    reps_array,
+                    self.rng.choice(array, rem, replace=False),
+                ])
+            self.rng.shuffle(reps_array)
+            return reps_array
 
     def __iter__(self):
 
-        if self.normal_count < len(self.normal_starts):
-            normals = self.rng.choice(self.normal_starts, self.normal_count, replace=False)
-        else:
-            reps = self.normal_count // len(self.normal_starts)
-            rem = self.normal_count - reps * len(self.normal_starts)
-            normals = np.tile(self.normal_starts, reps)
-            if rem:
-                normals = np.concatenate([
-                    normals,
-                    self.rng.choice(self.normal_starts, rem, replace=False),
-                ])
-            self.rng.shuffle(normals)
-
-        # с возращением если требуется больше чем есть иначе перестановка
-        sampled = self.rng.choice(self.anomaly_lines, self.minority_count,
-                                  replace=len(self.anomaly_lines) < self.minority_count)
+        normals = self.sample_count(self.normal_starts, self.normal_count)
 
         # для каждой — валидный диапазон стартов
         # аномалия стоит на строке с индедксом a
@@ -525,18 +532,26 @@ class JitterBalancedSampler(Sampler):
         # lo <= total - ws
         # трбеование не выхода за границы индексов окон со stride=1
 
-        lo = np.maximum(0, sampled - self.W + 1)
-        hi = np.minimum(sampled, self.N - self.W)
+        if self.do_random_shift_on_abnormal:
+            # с возращением если требуется больше чем есть иначе перестановка
+            sampled = self.rng.choice(self.anomaly_lines, self.minority_count,
+                                      replace=len(self.anomaly_lines) < self.minority_count)
 
-        # hi >= lo всегда, поскольку W <= N; проверка на всякий
-        # assert np.all(hi >= lo)
+            lo = np.maximum(0, sampled - self.W + 1)
+            hi = np.minimum(sampled, self.N - self.W)
 
-        # случайный старт в [lo, hi]
-        spans = hi - lo + 1
-        # генерация в диапазоне [0, 1) соотв после приведения к int останется [0, ..., spans_i-1],
-        # spans_i никогда не выпадет
-        offsets = (self.rng.random(self.minority_count) * spans).astype(np.int64)
-        anomalous = lo + np.minimum(offsets, spans - 1)
+            # hi >= lo всегда, поскольку W <= N; проверка на всякий
+            # assert np.all(hi >= lo)
+
+            # случайный старт в [lo, hi]
+            spans = hi - lo + 1
+            # генерация в диапазоне [0, 1) соотв после приведения к int останется [0, ..., spans_i-1],
+            # spans_i никогда не выпадет
+            offsets = (self.rng.random(self.minority_count) * spans).astype(np.int64)
+            anomalous = lo + np.minimum(offsets, spans - 1)
+        else:
+            anomalous = self.sample_count(self.abnormal_starts, self.minority_count)
+
 
         combined = np.concatenate([normals, anomalous])
         self.rng.shuffle(combined)
@@ -546,5 +561,5 @@ class JitterBalancedSampler(Sampler):
         return self.total_size
 
     def print_count(self, n, a, phrase=''):
-        print(f'{phrase}: число нормальных окон {n=}, аномальных (возможных стартовых позиций) {a=}, общее {n+a=}')
-        print(f'их доли: доля нормальных={n / (n + a) * 100:.3f}, аномальных={a / (n + a) * 100:.3f}')
+        print(f'{phrase}: {n=}, {a=}, общее {n+a=}')
+        print(f'их доли: frac_n={n / (n + a) * 100:.3f}, frac_a={a / (n + a) * 100:.3f}')
