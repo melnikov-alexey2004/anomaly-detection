@@ -101,6 +101,7 @@ class Config:
     # обучение
     num_epochs: int = 3
     learning_rate: float = 5e-5
+    lr_end: float = 1e-7 # if scheduler_type == linear
     weight_decay: float = 0.05
     warmup_steps: int = 200
     scheduler_type: str = "linear"
@@ -465,11 +466,13 @@ def _build_scheduler(optimizer, total_steps, cfg):
         return torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=total_steps
         )
-    from transformers import get_linear_schedule_with_warmup
-    return get_linear_schedule_with_warmup(
+    from transformers import get_linear_schedule_with_warmup, get_polynomial_decay_schedule_with_warmup
+    return get_polynomial_decay_schedule_with_warmup(
         optimizer,
         num_warmup_steps=cfg.warmup_steps,
         num_training_steps=total_steps,
+        lr_end=cfg.lr_end,
+        power=1,
     )
 
 
