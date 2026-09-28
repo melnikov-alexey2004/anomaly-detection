@@ -110,6 +110,8 @@ class Config:
     # sampler
     sampler_max_oversample: float = 10.0
     sampler_min_minority: int = 50
+    max_samples=None
+    min_samples=None
 
     # режим тренировки при continue_training
     train_mode: str = "all"  # "all" | "new_only" | "mixed"
@@ -427,7 +429,8 @@ def _build_train_loader(ds, eval_start_line, cfg, line_cache,
     if base_sampler is None:
         print("[sampler] строим BalancedSampler (может занять минуты)...")
         base_sampler = BalancedSampler(
-            ds, target_ratio=cfg.target_ratio, seed=cfg.seed,
+            ds, target_ratio=cfg.target_ratio, seed=cfg.seed, min_samples=cfg.min_samples,
+            max_samples=cfg.max_samples,
             max_oversample_factor=getattr(cfg, "sampler_max_oversample", 10.0),
             min_minority_for_balance=getattr(cfg, "sampler_min_minority", 50),
         )
