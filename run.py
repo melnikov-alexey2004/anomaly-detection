@@ -111,8 +111,8 @@ class Config:
     # sampler
     sampler_max_oversample: float = 10.0
     sampler_min_minority: int = 50
-    max_samples:int = None
-    min_samples:int = None
+    max_samples: typing.Optional[int] = None
+    min_samples: typing.Optional[int] = None
 
     # режим тренировки при continue_training
     train_mode: str = "all"  # "all" | "new_only" | "mixed"
@@ -398,8 +398,35 @@ def train_loop(model, optimizer, scheduler, train_loader,
 _DATASET_CLS = {"bgl": BGL, "tbird": Tbird, "spirit": Spirit,
                 "liberty": Liberty}
 
+def _log_zone_distribution(base_sampler, safe_min, safe_max, name="zone"):
+    """
+    Печатает распределение классов в окнах внутри [safe_min, safe_max).
+    Использует индексы из BalancedSampler — не требует повторного прохода.
+    """
+    min_idx = base_sampler.minority_indices
+    maj_idx = base_sampler.majority_indices
 
-def _build_loaders(ds, val_ds, cfg, line_cache):
+    if base_sampler.minority_label == "abnormal":
+        abnorm_idx, normal_idx = min_idx, maj_idx
+    else:
+        abnorm_idx, normal_idx = maj_idx, min_idx
+
+    mask_a = (abnorm_idx >= safe_min) & (abnorm_idx < safe_max)
+    mask_n = (normal_idx >= safe_min) & (normal_idx < safe_max)
+
+    n_abnorm = int(mask_a.sum())
+    n_normal = int(mask_n.sum())
+    total = n_abnorm + n_normal
+
+    if total == 0:
+        print(f"[{name}] зона [{safe_min}, {safe_max}): окон нет")
+        return
+
+    print(f"[{name}] зона [{safe_min}, {safe_max}): "
+          f"окон={total}, abnormal={n_abnorm} ({n_abnorm/total*100:.2f}%), "
+          f"normal={n_normal} ({n_normal/total*100:.2f}%)")
+
+def _build_loaders(ds, val_ds, cfg, line_cache, base_sampler=None):
     collate = make_collate_fn(line_cache)
     val_loader_small = DataLoader(
         LimitedIterable(val_ds, cfg.eval_max_windows),
@@ -410,7 +437,13 @@ def _build_loaders(ds, val_ds, cfg, line_cache):
         val_ds, batch_size=cfg.batch_size, shuffle=False,
         collate_fn=collate, num_workers=cfg.num_workers,
     )
+    if base_sampler is not None:
+        eval_start = val_ds.start_line
+        eval_end = val_ds.end_line
+        _log_zone_distribution(base_sampler, eval_start, eval_end,
+                               name="eval_zone")
     return val_loader_small, val_loader_full
+
 
 
 def _build_train_loader(ds, eval_start_line, cfg, line_cache,
@@ -457,6 +490,11 @@ def _build_train_loader(ds, eval_start_line, cfg, line_cache,
     print(f"[loader] train_ratio={cfg.train_ratio} → "
           f"train_limit={train_limit} safe_min={safe_min} "
           f"safe_max={safe_max} окон={len(train_sampler)}")
+
+    # ← НОВОЕ: распределение классов именно в этой зоне
+    _log_zone_distribution(base_sampler, safe_min, safe_max,
+                           name=f"train_zone r={cfg.train_ratio}")
+
     return train_loader, base_sampler
 
 
@@ -556,7 +594,7 @@ def run(cfg: Config):
         ds, eval_start_line, cfg, line_cache
     )
     val_loader_small, val_loader_full = _build_loaders(
-        ds, val_ds, cfg, line_cache
+        ds, val_ds, cfg, line_cache, base_sampler=base_sampler,
     )
 
     # модель
@@ -757,7 +795,6 @@ def continue_training(state: dict, cfg: Config) -> dict:
             prev_train_limit = int(ds.total_lines * prev_ratio)
 
             if train_mode == "mixed":
-                # сдвигаем нижнюю границу назад, чтобы захватить хвост старого
                 frac = getattr(cfg, "mixed_prev_fraction", 0.1)
                 prev_train_limit = int(prev_train_limit * (1.0 - frac))
                 print(f"[continue] train_mode=mixed, "
@@ -768,32 +805,33 @@ def continue_training(state: dict, cfg: Config) -> dict:
                 print(f"[continue] train_mode=new_only, "
                       f"prev_train_limit={prev_train_limit}")
 
-    # --- train_loader ---
+    # --- train_loader (строится ВСЕГДА, вне условия train_mode) ---
+    base_sampler = state.get("base_sampler")
     if cfg.train_ratio != state.get("train_ratio") \
             or cfg.batch_size != state["cfg"].batch_size:
         train_loader, base_sampler = _build_train_loader(
             ds, eval_start_line, cfg, line_cache,
-            base_sampler=state.get("base_sampler"),
+            base_sampler=base_sampler,
             prev_train_limit=prev_train_limit,
         )
         state["base_sampler"] = base_sampler
     else:
         train_loader = state["train_loader"]
 
-    # val_loader при смене batch_size
+    # --- val_loader при смене batch_size ---
     if cfg.batch_size != state["cfg"].batch_size:
         val_loader_small, val_loader_full = _build_loaders(
-            ds, val_ds, cfg, line_cache
+            ds, val_ds, cfg, line_cache, base_sampler=base_sampler,
         )
     else:
         val_loader_small = state["val_loader_small"]
         val_loader_full = state["val_loader_full"]
 
-    # scheduler
+    # --- scheduler ---
     total_steps = max(1, len(train_loader) * cfg.num_epochs)
     scheduler = _build_scheduler(optimizer, total_steps, cfg)
 
-    # append_metric
+    # --- append_metric ---
     local_metrics_path = f"/content/metrics_{cfg.run_tag}.pkl"
 
     def append_metric(record: dict):
@@ -805,14 +843,14 @@ def continue_training(state: dict, cfg: Config) -> dict:
             upload_file(local_metrics_path, repo_id,
                         f"runs/{cfg.run_tag}/metrics.pkl")
 
-    # конфиг
+    # --- конфиг ---
     if repo_id:
         with open("/content/config_run.json", "w") as f:
             f.write(cfg_to_json(cfg))
         upload_file("/content/config_run.json", repo_id,
                     f"runs/{cfg.run_tag}/config.json")
 
-    # train_loop
+    # --- train_loop ---
     start_epoch = state["start_epoch"]
     start_epoch, global_step = train_loop(
         model, optimizer, scheduler, train_loader,
@@ -821,7 +859,7 @@ def continue_training(state: dict, cfg: Config) -> dict:
         start_epoch, global_step, repo_id,
     )
 
-    # финальный чекпоинт
+    # --- финальный чекпоинт ---
     local_final = f"/content/final_{cfg.run_tag}"
     save_trainable(model, optimizer, scheduler, start_epoch,
                    global_step, local_final)
@@ -831,7 +869,7 @@ def continue_training(state: dict, cfg: Config) -> dict:
         upload_file(local_metrics_path, repo_id,
                     f"runs/{cfg.run_tag}/metrics.pkl")
 
-        # ─── merge в metrics_history.pkl ───
+        # --- merge в metrics_history.pkl ---
         merged = "/content/metrics_history.pkl"
         merged_data = []
         try:
@@ -855,6 +893,7 @@ def continue_training(state: dict, cfg: Config) -> dict:
             pickle.dump(merged_data, f)
         upload_file(merged, repo_id, "metrics_history.pkl")
 
+    # --- обновляем state ---
     state.update({
         "cfg": cfg,
         "train_loader": train_loader,

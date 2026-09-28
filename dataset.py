@@ -525,7 +525,7 @@ class BalancedSampler(Sampler):
         n_min = len(self.minority_indices)
         n_maj = len(self.majority_indices)
 
-        print(f'sampler: a={len(self.anomalous_indices)}, '
+        print(f'sampler: GLOBAL a={len(self.anomalous_indices)}, '
               f'n={len(self.normal_indices)}')
         t = n_min + n_maj
         if t > 0:
@@ -616,7 +616,7 @@ class BalancedSampler(Sampler):
         combined = np.concatenate([oversampled_minority, oversampled_majority])
         self.rng.shuffle(combined)
 
-        print(f'sampler: num {self.majority_label}={len(oversampled_majority)}, '
+        print(f'sampler: GLOBAL num {self.majority_label}={len(oversampled_majority)}, '
               f'num {self.minority_label}={len(oversampled_minority)}')
         t = len(oversampled_majority) + len(oversampled_minority)
         if t > 0:
