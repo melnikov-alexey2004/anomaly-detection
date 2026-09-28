@@ -110,8 +110,8 @@ class Config:
     # sampler
     sampler_max_oversample: float = 10.0
     sampler_min_minority: int = 50
-    max_samples=None
-    min_samples=None
+    max_samples:int = None
+    min_samples:int = None
 
     # режим тренировки при continue_training
     train_mode: str = "all"  # "all" | "new_only" | "mixed"
