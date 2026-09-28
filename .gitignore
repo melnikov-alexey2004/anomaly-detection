@@ -1,3 +1,4 @@
 /archive_extracted
 /.idea/
 **/__pycache__/
+.mypy_cache/
