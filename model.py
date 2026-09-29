@@ -389,21 +389,26 @@ class LogAnomalyModel(nn.Module):
         target_dtype = next(self.projector.parameters()).dtype
         log_embs = log_embs.to(target_dtype)
 
-        x = self.projector(log_embs)                              # [B,L,H]
+        x = self.projector(log_embs)  # [B,L,H]
         B, L, _ = x.shape
 
+        # --- CLS ---
         if self.use_cls:
             cls = self.cls_emb.expand(B, -1, -1).to(x.dtype)
-            x = torch.cat([cls, x], dim=1)                        # [B,L+1,H]
-            ones = torch.ones(B, 1, dtype=attention_mask.dtype,
-                              device=x.device)
+            x = torch.cat([cls, x], dim=1)  # [B,L+1,H]
+            ones = torch.ones(B, 1, dtype=attention_mask.dtype, device=x.device)
             attention_mask = torch.cat([ones, attention_mask], dim=1)
 
-        original_len = attention_mask.shape[1]                    # до longformer
+        # всегда cls токен смотрит на всю посл-ть
+        global_attn = torch.zeros_like(attention_mask)
+        global_attn[:, 0] = 1
+
+        original_len = attention_mask.shape[1]
 
         lf_out = self.longformer(
             inputs_embeds=x,
             attention_mask=attention_mask,
+            global_attention_mask=global_attn,
             output_hidden_states=True,
         )
 
@@ -414,7 +419,7 @@ class LogAnomalyModel(nn.Module):
         K = self.aggregator.k
 
         if self.use_cls:
-            hs = torch.stack([h[:, 0] for h in hidden[-K:]], dim=0)   # [K,B,H]
+            hs = torch.stack([h[:, 0] for h in hidden[-K:]], dim=0)  # [K,B,H]
             if self.aggregator.mode == "weighted":
                 w = torch.softmax(self.aggregator.layer_weights, dim=0)
                 pooled = (hs * w.view(-1, 1, 1)).sum(dim=0)
@@ -423,7 +428,7 @@ class LogAnomalyModel(nn.Module):
         else:
             pooled = self.aggregator(hidden, attention_mask)
 
-        # Временные признаки (усреднённые по окну)
+        # --- временные признаки ---
         time_feats = []
         for b in range(B):
             t_list = times[b]

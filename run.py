@@ -95,7 +95,7 @@ class Config:
     lora_alpha: int = 16
     lora_dropout: float = 0.15
     lora_target_modules: typing.List[str] = dataclasses.field(
-        default_factory=lambda: ["query", "key", "value", "dense"]
+        default_factory=lambda: ["query", "key", "value", "dense", "key_global", "query_global", "value_global"]
     )
 
     # обучение
