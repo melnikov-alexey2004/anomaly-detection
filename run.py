@@ -265,7 +265,7 @@ def train_loop(model, optimizer, scheduler, train_loader,
         running, n_run = 0.0, 0
         t0 = time.time()
 
-        pbar = tqdm.tqdm(train_loader, desc=f"epoch {epoch}", leave=False)
+        pbar = tqdm.tqdm(train_loader, desc=f"epoch {epoch}", leave=True)
         for step, batch in enumerate(pbar):
             if batch is None:
                 continue
