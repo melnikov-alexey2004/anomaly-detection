@@ -9,7 +9,7 @@ import hashlib
 import contextlib
 import datetime as _dt
 from collections import OrderedDict
-import tqdm.auto as tqdm
+import tqdm
 import numpy as np
 import torch
 import torch.nn as nn
@@ -487,7 +487,7 @@ def evaluate(model, loader, device, criterion, autocast_ctx=None,
     if autocast_ctx is None:
         autocast_ctx = contextlib.nullcontext()
 
-    pbar = tqdm.tqdm(loader, desc=desc, leave=False)
+    pbar = tqdm.tqdm(loader, desc=desc, leave=True)
     for i, batch in enumerate(pbar):
         if max_batches is not None and i >= max_batches:
             break

@@ -12,7 +12,7 @@ import typing
 import dataclasses
 import datetime as _dt
 
-import tqdm.auto as tqdm
+import tqdm
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Sampler
@@ -540,6 +540,8 @@ def run(cfg: Config):
     np.random.seed(cfg.seed)
     torch.manual_seed(cfg.seed)
     torch.cuda.manual_seed_all(cfg.seed)
+    # torch.backends.cudnn.enabled = True
+    # torch.backends.cudnn.deterministic = True
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[env] device={device}, cuda_available={torch.cuda.is_available()}")
@@ -635,10 +637,23 @@ def run(cfg: Config):
         print(f"[resume] start_epoch={start_epoch} step={global_step}")
 
     # optimizer + scheduler
-    optimizer = torch.optim.AdamW(
-        [p for p in model.parameters() if p.requires_grad],
-        lr=cfg.learning_rate, weight_decay=cfg.weight_decay,
-    )
+    # в run() вместо текущего optimizer
+    decay, no_decay = [], []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if p.dim() <= 1:  # bias, LayerNorm weight/bias
+            no_decay.append(p)
+        elif "LayerNorm" in name or "layer_norm" in name:
+            no_decay.append(p)
+        else:
+            decay.append(p)
+
+    optimizer = torch.optim.AdamW([
+        {"params": decay, "weight_decay": cfg.weight_decay},
+        {"params": no_decay, "weight_decay": 0.0},
+    ], lr=cfg.learning_rate)
+
     total_steps = max(1, len(train_loader) * cfg.num_epochs)
     scheduler = _build_scheduler(optimizer, total_steps, cfg)
 
