@@ -9,7 +9,7 @@ import hashlib
 import contextlib
 import datetime as _dt
 from collections import OrderedDict
-import tqdm
+import tqdm.auto as tqdm
 import numpy as np
 import torch
 import torch.nn as nn
@@ -31,18 +31,18 @@ class Time2Vec(nn.Module):
     """t2v(t)[0] = w0·t + b0; t2v(t)[i] = sin(w_i·t + b_i)."""
     def __init__(self, k: int = 16):
         super().__init__()
-        self.k  = k
+        self.k = k
         self.w0 = nn.Parameter(torch.randn(1) * 0.01)
         self.b0 = nn.Parameter(torch.zeros(1))
-        self.w  = nn.Parameter(torch.randn(k) * 0.01)
-        self.b  = nn.Parameter(torch.zeros(k))
+        self.w = nn.Parameter(torch.randn(k) * 0.01)
+        self.b = nn.Parameter(torch.zeros(k))
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
         if t.dim() == 2:
             t = t.squeeze(-1)
-        lin = (self.w0 * t + self.b0).unsqueeze(-1)          # [N,1]
-        per = torch.sin(t.unsqueeze(-1) * self.w + self.b)   # [N,k]
-        return torch.cat([lin, per], dim=-1)                 # [N,k+1]
+        lin = (self.w0 * t + self.b0).unsqueeze(-1)
+        per = torch.sin(t.unsqueeze(-1) * self.w + self.b)
+        return torch.cat([lin, per], dim=-1)
 
 
 def cyclic_time_features(times: typing.List[_dt.datetime]) -> torch.Tensor:
@@ -51,14 +51,14 @@ def cyclic_time_features(times: typing.List[_dt.datetime]) -> torch.Tensor:
         if t is None:
             feats.append([0.0] * 10)
             continue
-        h   = t.hour / 24.0
-        m   = t.minute / 60.0
+        h = t.hour / 24.0
+        m = t.minute / 60.0
         dow = t.weekday() / 7.0
         mon = (t.month - 1) / 12.0
         dom = (t.day - 1) / 31.0
         feats.append([
-            math.sin(2 * math.pi * h),   math.cos(2 * math.pi * h),
-            math.sin(2 * math.pi * m),   math.cos(2 * math.pi * m),
+            math.sin(2 * math.pi * h), math.cos(2 * math.pi * h),
+            math.sin(2 * math.pi * m), math.cos(2 * math.pi * m),
             math.sin(2 * math.pi * dow), math.cos(2 * math.pi * dow),
             math.sin(2 * math.pi * mon), math.cos(2 * math.pi * mon),
             math.sin(2 * math.pi * dom), math.cos(2 * math.pi * dom),
@@ -73,7 +73,7 @@ def time_delta_features(times: typing.List[_dt.datetime]) -> torch.Tensor:
             deltas.append(0.0)
         else:
             deltas.append(float((t - times[i - 1]).total_seconds()))
-    return torch.tensor(deltas, dtype=torch.float32).unsqueeze(-1)  # [N,1]
+    return torch.tensor(deltas, dtype=torch.float32).unsqueeze(-1)
 
 
 # ============================================================
@@ -148,7 +148,7 @@ class LineEmbeddingCache:
             new_embs = []
             for j in range(0, len(miss_lines), self.encode_batch):
                 chunk = miss_lines[j:j + self.encode_batch]
-                emb = self.encode_fn(chunk)                       # GPU bf16
+                emb = self.encode_fn(chunk)
                 new_embs.append(emb.detach().to("cpu"))
             new_embs = torch.cat(new_embs, dim=0)
             for j, i in enumerate(miss_i):
@@ -160,7 +160,7 @@ class LineEmbeddingCache:
             for _ in range(max(0, overflow)):
                 self.cache.popitem(last=False)
 
-        return torch.stack(out, dim=0)                            # [N,D] CPU
+        return torch.stack(out, dim=0)
 
     def stats(self) -> str:
         t = self.hits + self.misses
@@ -176,7 +176,7 @@ def make_collate_fn(cache: LineEmbeddingCache):
         for window, window_times, _raws, label in batch:
             if not window:
                 continue
-            emb = cache.get_batch(window)                         # [n_i,D] CPU
+            emb = cache.get_batch(window)
             windows.append(emb)
             times_list.append(window_times)
             labels.append(float(label))
@@ -186,11 +186,11 @@ def make_collate_fn(cache: LineEmbeddingCache):
         max_len = max(e.shape[0] for e in windows)
         D = windows[0].shape[1]
         padded = torch.zeros(len(windows), max_len, D, dtype=torch.bfloat16)
-        mask   = torch.zeros(len(windows), max_len, dtype=torch.long)
+        mask = torch.zeros(len(windows), max_len, dtype=torch.long)
         for i, e in enumerate(windows):
             n = e.shape[0]
             padded[i, :n] = e
-            mask[i, :n]   = 1
+            mask[i, :n] = 1
 
         return {
             "log_embs": padded,
@@ -202,14 +202,14 @@ def make_collate_fn(cache: LineEmbeddingCache):
 
 
 # ============================================================
-# 4. Проектор Jasper → Longformer
+# 4. Проектор Jasper -> Longformer
 # ============================================================
 
 class LogProjector(nn.Module):
     """
-    LayerNorm → Linear → GELU → Linear, последний Linear — zero-init.
+    LayerNorm -> Linear -> GELU -> Linear, последний Linear — zero-init.
     При in_dim == out_dim добавляется residual (identity-старт).
-    При разных размерностях residual = Linear(in→out) без bias.
+    При разных размерностях residual = Linear(in->out) без bias.
     """
     def __init__(self, in_dim: int, out_dim: int, hidden_mult: int = 2):
         super().__init__()
@@ -245,7 +245,7 @@ class LayerAggregator(nn.Module):
             self.pool_q = nn.Parameter(torch.randn(hidden) * 0.02)
 
     def forward(self, hidden_states, attention_mask):
-        hs = torch.stack(hidden_states[-self.k:], dim=0)          # [K,B,L,H]
+        hs = torch.stack(hidden_states[-self.k:], dim=0)
         if self.mode == "mean":
             h = hs.mean(dim=0)
         elif self.mode == "weighted":
@@ -254,7 +254,7 @@ class LayerAggregator(nn.Module):
         elif self.mode == "last":
             h = hs[-1]
         else:
-            h = hs.mean(dim=0)                                     # fallback
+            h = hs.mean(dim=0)
 
         if self.mode == "attn_pool":
             score = (h @ self.pool_q) / math.sqrt(h.shape[-1])
@@ -272,8 +272,8 @@ class LayerAggregator(nn.Module):
 
 _DTYPE_MAP = {
     "bfloat16": torch.bfloat16,
-    "float16":  torch.float16,
-    "float32":  torch.float32,
+    "float16": torch.float16,
+    "float32": torch.float32,
 }
 
 
@@ -334,7 +334,7 @@ class LogAnomalyModel(nn.Module):
         lf_hidden = self.longformer.config.hidden_size
         self.lf_hidden = lf_hidden
 
-        self.projector  = LogProjector(jasper_dim, lf_hidden)
+        self.projector = LogProjector(jasper_dim, lf_hidden)
         self.aggregator = LayerAggregator(
             lf_hidden, k=cfg.aggregate_layers, mode=cfg.aggregate_mode,
         )
@@ -399,9 +399,12 @@ class LogAnomalyModel(nn.Module):
             ones = torch.ones(B, 1, dtype=attention_mask.dtype, device=x.device)
             attention_mask = torch.cat([ones, attention_mask], dim=1)
 
-        # всегда cls токен смотрит на всю посл-ть
-        global_attn = torch.zeros_like(attention_mask)
-        global_attn[:, 0] = 1
+        # --- global attention: только для CLS ---
+        if self.use_cls:
+            global_attn = torch.zeros_like(attention_mask)
+            global_attn[:, 0] = 1
+        else:
+            global_attn = torch.zeros_like(attention_mask)
 
         original_len = attention_mask.shape[1]
 
@@ -467,7 +470,6 @@ def autocast_context(cfg):
     if not cfg.use_autocast or not torch.cuda.is_available():
         return contextlib.nullcontext()
     if cfg.use_quantization:
-        # bnb сам управляет compute dtype — внешний autocast не нужен
         return contextlib.nullcontext()
     return torch.autocast("cuda", dtype=resolve_dtype(cfg))
 
@@ -487,7 +489,7 @@ def evaluate(model, loader, device, criterion, autocast_ctx=None,
     if autocast_ctx is None:
         autocast_ctx = contextlib.nullcontext()
 
-    pbar = tqdm.tqdm(loader, desc=desc, leave=True)
+    pbar = tqdm.tqdm(loader, desc=desc, leave=False)
     for i, batch in enumerate(pbar):
         if max_batches is not None and i >= max_batches:
             break
@@ -495,12 +497,14 @@ def evaluate(model, loader, device, criterion, autocast_ctx=None,
         if batch is None:
             continue
         log_embs = batch["log_embs"].to(device)
-        mask     = batch["attention_mask"].to(device)
-        y        = batch["labels"].to(device)
+        mask = batch["attention_mask"].to(device)
+        y = batch["labels"].to(device)
 
         with autocast_ctx:
             logits = model(log_embs, batch["times"], mask)
-        losses.append(criterion(logits.float(), y).item() if not torch.isnan(logits).any() else float("nan"))
+        loss_val = criterion(logits.float(), y).item()
+        if not np.isnan(loss_val) and not np.isinf(loss_val):
+            losses.append(loss_val)
         probs.append(torch.sigmoid(logits.float()).cpu())
         ys.append(y.cpu())
         n_seen += y.numel()
@@ -509,14 +513,13 @@ def evaluate(model, loader, device, criterion, autocast_ctx=None,
         if max_windows is not None and n_seen >= max_windows:
             break
 
-    if not losses:
+    if not probs:
         return {"loss": 0.0, "precision": 0.0, "recall": 0.0, "f1": 0.0,
                 "n_windows": 0, "n_pos": 0}
 
     p_prob = torch.cat(probs).numpy()
     y_true = torch.cat(ys).numpy().astype(int)
 
-    # отсеять NaN
     valid = ~np.isnan(p_prob)
     n_nan = int((~valid).sum())
     if n_nan > 0:
@@ -533,8 +536,9 @@ def evaluate(model, loader, device, criterion, autocast_ctx=None,
     pr, rc, f1, _ = precision_recall_fscore_support(
         y_true, y_pred, average="binary", zero_division=0
     )
+    mean_loss = float(np.mean(losses)) if losses else float("nan")
     return {
-        "loss": float(np.mean(losses)),
+        "loss": mean_loss,
         "precision": float(pr),
         "recall": float(rc),
         "f1": float(f1),
@@ -552,9 +556,9 @@ def save_trainable(model, optimizer, scheduler, epoch, global_step, save_dir):
     model.longformer.save_pretrained(os.path.join(save_dir, "adapter"))
     torch.save({
         "head_state": model.head_state_dict(),
-        "optimizer":  optimizer.state_dict(),
-        "scheduler":  scheduler.state_dict(),
-        "epoch":      epoch,
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict(),
+        "epoch": epoch,
         "global_step": global_step,
     }, os.path.join(save_dir, "train_state.pt"))
 
@@ -569,11 +573,8 @@ def load_adapter_into(model, adapter_dir: str):
     from safetensors.torch import load_file
 
     if not os.path.isdir(adapter_dir):
-        raise FileNotFoundError(
-            f"adapter_dir не существует: {adapter_dir}"
-        )
+        raise FileNotFoundError(f"adapter_dir не существует: {adapter_dir}")
 
-    # читаем state dict адаптера
     state = None
     for fname in ("adapter_model.safetensors", "adapter_model.bin"):
         path = os.path.join(adapter_dir, fname)
@@ -582,11 +583,8 @@ def load_adapter_into(model, adapter_dir: str):
                      else torch.load(path, map_location="cpu"))
             break
     if state is None:
-        raise FileNotFoundError(
-            f"нет adapter_model.safetensors или adapter_model.bin в {adapter_dir}"
-        )
+        raise FileNotFoundError(f"нет adapter_model.* в {adapter_dir}")
 
-    # загружаем веса в существующий адаптер "default"
     result = set_peft_model_state_dict(model.longformer, state)
     print(f"[load_adapter] loaded keys: {len(state)}")
     if result is not None and hasattr(result, "missing_keys"):
@@ -595,7 +593,6 @@ def load_adapter_into(model, adapter_dir: str):
         if result.unexpected_keys:
             print(f"[load_adapter] unexpected: {len(result.unexpected_keys)}")
 
-    # включаем адаптер и разморозить LoRA-параметры
     if hasattr(model.longformer, "set_adapter"):
         try:
             model.longformer.set_adapter("default")
@@ -605,8 +602,3 @@ def load_adapter_into(model, adapter_dir: str):
     for n, p in model.longformer.named_parameters():
         if "lora_" in n:
             p.requires_grad_(True)
-
-
-
-# load_trainable удалён: resume-логика целиком реализована в run.py,
-# чтобы optimizer/scheduler создавались ПОСЛЕ load_adapter_into.

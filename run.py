@@ -12,7 +12,7 @@ import typing
 import dataclasses
 import datetime as _dt
 
-import tqdm
+import tqdm.auto as tqdm
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Sampler
@@ -45,10 +45,11 @@ class Config:
     step_size: int = 199
     anchor_step: int = 10
     batch_size: int = 16
-    num_workers: int = 0 # todo: запретить другое значение
+    num_workers: int = 0
     use_in_colab: bool = True
-    max_lines: typing.Optional[int] = None
-    # todo: start_line + max_lines
+    max_lines: typing.Optional[int] = None      # сколько строк максимум от start_line
+    start_line: int = 0                          # с какой строки файла начинать (абсолютно)
+    end_line: typing.Optional[int] = None        # до какой строки (не включая). None = до конца
 
     # доли
     eval_start_ratio: float = 0.9
@@ -56,7 +57,7 @@ class Config:
     target_ratio: float = 0.3
 
     # eval
-    eval_max_windows: int = 2000
+    eval_max_windows: typing.Optional[int] = 2000
     metrics_log_every: int = 100
     final_full_eval: bool = True
 
@@ -96,13 +97,13 @@ class Config:
     lora_alpha: int = 16
     lora_dropout: float = 0.15
     lora_target_modules: typing.List[str] = dataclasses.field(
-        default_factory=lambda: ["query", "key", "value", "dense", "key_global", "query_global", "value_global"]
+        default_factory=lambda: ["query", "key", "value", "dense"]
     )
 
     # обучение
     num_epochs: int = 3
     learning_rate: float = 5e-5
-    lr_end: float = 1e-7 # if scheduler_type == linear
+    lr_end: float = 1e-7
     weight_decay: float = 0.05
     warmup_steps: int = 200
     scheduler_type: str = "linear"
@@ -117,12 +118,8 @@ class Config:
 
     # режим тренировки при continue_training
     train_mode: str = "all"  # "all" | "new_only" | "mixed"
-    mixed_prev_fraction: float = 0.1  # доля старого диапазона для "mixed"
-    # "all" — учиться на всём [0, train_limit) (текущее поведение);
-    #
-    # "new_only" — только на [prev_limit, new_limit);
-    #
-    # "mixed" — на [(1-f)*prev_limit, new_limit) — 90% нового + 10% старого.
+    mixed_prev_fraction: float = 0.1
+
     # Hub
     push_to_hub: bool = True
     hub_repo_id: typing.Optional[str] = None
@@ -132,7 +129,7 @@ class Config:
 
 
 # ============================================================
-# Config ↔ JSON
+# Config <-> JSON
 # ============================================================
 
 def cfg_to_json_dict(cfg: Config) -> dict:
@@ -271,8 +268,8 @@ def train_loop(model, optimizer, scheduler, train_loader,
             if batch is None:
                 continue
             log_embs = batch["log_embs"].to(device)
-            mask     = batch["attention_mask"].to(device)
-            y        = batch["labels"].to(device)
+            mask = batch["attention_mask"].to(device)
+            y = batch["labels"].to(device)
 
             optimizer.zero_grad()
             with autocast_ctx:
@@ -328,11 +325,14 @@ def train_loop(model, optimizer, scheduler, train_loader,
                     "eval": ev,
                     "train_ratio": cfg.train_ratio,
                     "eval_start_ratio": cfg.eval_start_ratio,
+                    "target_ratio": cfg.target_ratio,
                     "elapsed_sec": time.time() - t0,
                 }
                 append_metric(rec)
                 print(f"[e{epoch} s{global_step}] "
                       f"train={running/max(n_run,1):.4f} "
+                      f"lr={scheduler.get_last_lr()[0]:.2e} "
+                      f"elapsed={time.time() - t0:.0f}s "
                       f"eval_f1={ev['f1']:.4f} P={ev['precision']:.3f} "
                       f"R={ev['recall']:.3f} n={ev['n_windows']}")
                 model.train()
@@ -350,12 +350,19 @@ def train_loop(model, optimizer, scheduler, train_loader,
             "eval": ev,
             "train_ratio": cfg.train_ratio,
             "eval_start_ratio": cfg.eval_start_ratio,
+            "target_ratio": cfg.target_ratio,
             "elapsed_sec": time.time() - t0,
         }
         append_metric(rec)
-        print(f"[end e{epoch}] eval_f1={ev['f1']:.4f} "
-              f"P={ev['precision']:.3f} R={ev['recall']:.3f} "
-              f"n={ev['n_windows']} cache: {line_cache.stats()}")
+        print(f"[end e{epoch}] "
+              f"loss={running / max(n_run, 1):.4f} "
+              f"lr={scheduler.get_last_lr()[0]:.2e} "
+              f"elapsed={time.time() - t0:.0f}s "
+              f"F1={ev['f1']:.4f} "
+              f"P={ev['precision']:.3f} "
+              f"R={ev['recall']:.3f} "
+              f"n={ev['n_windows']} "
+              f"cache: {line_cache.stats()}")
 
         # чекпоинт
         local_ckpt = f"/content/ckpt_{cfg.run_tag}_e{epoch}"
@@ -368,7 +375,7 @@ def train_loop(model, optimizer, scheduler, train_loader,
                           f"runs/{cfg.run_tag}/adapter")
             upload_file(os.path.join(local_ckpt, "train_state.pt"),
                         repo_id, f"runs/{cfg.run_tag}/train_state.pt")
-        print(f"[save] epoch {epoch} → {local_ckpt}")
+        print(f"[save] epoch {epoch} -> {local_ckpt}")
 
     # финальный полный eval
     if cfg.final_full_eval:
@@ -383,6 +390,7 @@ def train_loop(model, optimizer, scheduler, train_loader,
             "eval": ev,
             "train_ratio": cfg.train_ratio,
             "eval_start_ratio": cfg.eval_start_ratio,
+            "target_ratio": cfg.target_ratio,
         }
         append_metric(rec)
         print(f"[final full eval] f1={ev['f1']:.4f} "
@@ -396,8 +404,8 @@ def train_loop(model, optimizer, scheduler, train_loader,
 # Вспомогательные сборки
 # ============================================================
 
-_DATASET_CLS = {"bgl": BGL, "tbird": Tbird, "spirit": Spirit,
-                "liberty": Liberty}
+_DATASET_CLS = {"bgl": BGL, "tbird": Tbird, "spirit": Spirit, "liberty": Liberty}
+
 
 def _log_zone_distribution(base_sampler, safe_min, safe_max, name="zone"):
     """
@@ -427,6 +435,7 @@ def _log_zone_distribution(base_sampler, safe_min, safe_max, name="zone"):
           f"окон={total}, abnormal={n_abnorm} ({n_abnorm/total*100:.2f}%), "
           f"normal={n_normal} ({n_normal/total*100:.2f}%)")
 
+
 def _build_loaders(ds, val_ds, cfg, line_cache, base_sampler=None):
     collate = make_collate_fn(line_cache)
     val_loader_small = DataLoader(
@@ -446,7 +455,6 @@ def _build_loaders(ds, val_ds, cfg, line_cache, base_sampler=None):
     return val_loader_small, val_loader_full
 
 
-
 def _build_train_loader(ds, eval_start_line, cfg, line_cache,
                         base_sampler=None, prev_train_limit=None):
     """
@@ -464,8 +472,8 @@ def _build_train_loader(ds, eval_start_line, cfg, line_cache,
     if base_sampler is None:
         print("[sampler] строим BalancedSampler (может занять минуты)...")
         base_sampler = BalancedSampler(
-            ds, target_ratio=cfg.target_ratio, seed=cfg.seed, min_samples=cfg.min_samples,
-            max_samples=cfg.max_samples,
+            ds, target_ratio=cfg.target_ratio, seed=cfg.seed,
+            min_samples=cfg.min_samples, max_samples=cfg.max_samples,
             max_oversample_factor=getattr(cfg, "sampler_max_oversample", 10.0),
             min_minority_for_balance=getattr(cfg, "sampler_min_minority", 50),
         )
@@ -473,7 +481,6 @@ def _build_train_loader(ds, eval_start_line, cfg, line_cache,
     else:
         print("[sampler] переиспользуем существующий BalancedSampler")
 
-    # нижняя граница диапазона
     safe_min = 0
     if prev_train_limit is not None and prev_train_limit > 0:
         safe_min = min(prev_train_limit, safe_max)
@@ -488,16 +495,14 @@ def _build_train_loader(ds, eval_start_line, cfg, line_cache,
         ds, batch_size=cfg.batch_size, sampler=train_sampler,
         collate_fn=collate, num_workers=cfg.num_workers,
     )
-    print(f"[loader] train_ratio={cfg.train_ratio} → "
+    print(f"[loader] train_ratio={cfg.train_ratio} -> "
           f"train_limit={train_limit} safe_min={safe_min} "
           f"safe_max={safe_max} окон={len(train_sampler)}")
 
-    # ← НОВОЕ: распределение классов именно в этой зоне
     _log_zone_distribution(base_sampler, safe_min, safe_max,
                            name=f"train_zone r={cfg.train_ratio}")
 
     return train_loader, base_sampler
-
 
 
 def _build_scheduler(optimizer, total_steps, cfg):
@@ -505,7 +510,7 @@ def _build_scheduler(optimizer, total_steps, cfg):
         return torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=total_steps
         )
-    from transformers import get_linear_schedule_with_warmup, get_polynomial_decay_schedule_with_warmup
+    from transformers import get_polynomial_decay_schedule_with_warmup
     return get_polynomial_decay_schedule_with_warmup(
         optimizer,
         num_warmup_steps=cfg.warmup_steps,
@@ -541,8 +546,6 @@ def run(cfg: Config):
     np.random.seed(cfg.seed)
     torch.manual_seed(cfg.seed)
     torch.cuda.manual_seed_all(cfg.seed)
-    # torch.backends.cudnn.enabled = True
-    # torch.backends.cudnn.deterministic = True
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[env] device={device}, cuda_available={torch.cuda.is_available()}")
@@ -568,6 +571,8 @@ def run(cfg: Config):
         window_size=cfg.win_size,
         step_size=cfg.step_size,
         max_lines=max_lines,
+        start_line=cfg.start_line,
+        end_line=cfg.end_line,
         use_in_colab=cfg.use_in_colab,
     )
     ds = SuperComputerDataset(d, cfg.anchor_step,
@@ -638,23 +643,10 @@ def run(cfg: Config):
         print(f"[resume] start_epoch={start_epoch} step={global_step}")
 
     # optimizer + scheduler
-    # в run() вместо текущего optimizer
-    decay, no_decay = [], []
-    for name, p in model.named_parameters():
-        if not p.requires_grad:
-            continue
-        if p.dim() <= 1:  # bias, LayerNorm weight/bias
-            no_decay.append(p)
-        elif "LayerNorm" in name or "layer_norm" in name:
-            no_decay.append(p)
-        else:
-            decay.append(p)
-
-    optimizer = torch.optim.AdamW([
-        {"params": decay, "weight_decay": cfg.weight_decay},
-        {"params": no_decay, "weight_decay": 0.0},
-    ], lr=cfg.learning_rate)
-
+    optimizer = torch.optim.AdamW(
+        [p for p in model.parameters() if p.requires_grad],
+        lr=cfg.learning_rate, weight_decay=cfg.weight_decay,
+    )
     total_steps = max(1, len(train_loader) * cfg.num_epochs)
     scheduler = _build_scheduler(optimizer, total_steps, cfg)
 
@@ -720,7 +712,6 @@ def run(cfg: Config):
         upload_file(local_metrics_path, repo_id,
                     f"{run_path_in_repo}/metrics.pkl")
 
-        # объединённая история с дедупликацией
         merged = "/content/metrics_history.pkl"
         merged_data = []
         try:
@@ -743,7 +734,7 @@ def run(cfg: Config):
         with open(merged, "wb") as f:
             pickle.dump(merged_data, f)
         upload_file(merged, repo_id, "metrics_history.pkl")
-        print(f"[hf] done → https://huggingface.co/{repo_id}")
+        print(f"[hf] done -> https://huggingface.co/{repo_id}")
 
     return {
         "model": model,
@@ -767,7 +758,7 @@ def run(cfg: Config):
         "cfg": cfg,
         "device": device,
         "repo_id": repo_id,
-        "base_sampler": base_sampler,        # ← сохраняем для переиспользования
+        "base_sampler": base_sampler,
     }
 
 
@@ -885,7 +876,7 @@ def continue_training(state: dict, cfg: Config) -> dict:
         upload_file(local_metrics_path, repo_id,
                     f"runs/{cfg.run_tag}/metrics.pkl")
 
-        # --- merge в metrics_history.pkl ---
+        # merge в metrics_history.pkl
         merged = "/content/metrics_history.pkl"
         merged_data = []
         try:

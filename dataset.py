@@ -20,7 +20,10 @@ class Data:
                  repeat_download: bool = False,
                  custom_archive_path: typing.Optional[str] = None, remove_archive: bool = False,
                  archive_type=None, use_in_colab: bool = False, encoding: str = "latin-1",
-                 errors: str = "replace", max_lines: float=math.inf,
+                 errors: str = "replace",
+                 max_lines: float = math.inf,
+                 start_line: int = 0,
+                 end_line: typing.Optional[int] = None,
                  window_size: int = 200,
                  step_size: int = 200,
                  ):
@@ -30,6 +33,8 @@ class Data:
         assert window_size > 1
         assert step_size >= 1
         assert max_lines >= 0
+        assert start_line >= 0
+        assert end_line is None or end_line > start_line
 
         colab_content = "/content/"
         if use_in_colab:
@@ -40,6 +45,8 @@ class Data:
             warnings.warn("use_in_colab = False но при этом существует /content/")
 
         self.max_lines = max_lines
+        self.start_line = start_line
+        self.end_line = end_line
         self.window_size = window_size
         self.step_size = step_size
         self.cache_dir = cache_dir
@@ -51,12 +58,12 @@ class Data:
         self.encoding = encoding
         self.errors = errors
 
-        if not os.path.exists(cache_dir): raise FileExistsError
+        if not os.path.exists(cache_dir):
+            raise FileExistsError
         if not repeat_download and os.path.exists(os.path.join(cache_dir, dataset_dir)):
             print('exist')
         else:
             if custom_archive_path is None:
-
                 if os.path.exists(os.path.join(cache_dir, dataset_dir)):
                     warnings.warn("you use repeat download with downloaded archive, repeat_download=True")
 
@@ -69,22 +76,15 @@ class Data:
                             '--retry-all-errors', '-L',
                             downloaded_url]
                     res = subprocess.run(args, capture_output=True, text=True)
-
                     print('stdout from curl', res.stdout)
                     print('stderr from curl', res.stderr)
                     print('download ends')
             else:
                 filepath = custom_archive_path
-
                 assert os.path.exists(filepath)
 
             print('archive', filepath, 'will extract')
             archive_path = filepath
-            # поддерживаются те что втсречались в логхабе. не встречал  “bztar”, “xztar”, or “zstdtar”
-            # поэтому их  поддержки нету
-            # unpack_archive поддерживает след
-            # “zip”, “tar”, “gztar”, “bztar”, “xztar”, or “zstdtar”
-            # +gzip
 
             get_mime_type = lambda fp, p: \
             subprocess.run(['file', f'-{p}', fp], capture_output=True, text=True).stdout.split()[
@@ -92,7 +92,6 @@ class Data:
 
             if archive_type is None:
                 print("автоопределение типа архива")
-
                 exact_tp = None
 
                 pref, tp = get_mime_type(filepath, 'iz')
@@ -100,20 +99,16 @@ class Data:
                     pref = "text"
 
                 if pref == "text":
-                    # not tar gz
                     pref2, tp2 = get_mime_type(filepath, 'i')
                     if pref2 == "application":
                         if tp2 == "gzip":
-                            # gz
                             exact_tp = "GZIP"
                         elif tp2 == "zip":
                             exact_tp = "zip"
                         elif tp2 == "x-tar":
                             exact_tp = "tar"
-
                 else:
                     if pref == "application" and tp == "x-tar":
-                        # tar gz
                         exact_tp = "gztar"
             else:
                 exact_tp = archive_type
@@ -128,7 +123,6 @@ class Data:
             print(f"{exact_tp=}, {pref=}, {tp=}, {extract_dir=}")
 
             if exact_tp == "GZIP":
-                # custom
                 with gzip.open(filepath, 'rb') as f_in:
                     with open(extract_dir + f"/{dataset_dir}.log", 'wb') as f_out:
                         shutil.copyfileobj(f_in, f_out)
@@ -140,7 +134,6 @@ class Data:
 
             print('extracted in', extract_dir)
             if remove_archive:
-                # не удаляем из cache_Dir
                 os.remove(archive_path)
                 print('archive removed', )
 
@@ -149,7 +142,8 @@ class Data:
         s = raw_log.split()
         label = 1
         try:
-            if s[0] == "-": label = 0
+            if s[0] == "-":
+                label = 0
             ts = int(s[1])
             dt = datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc)
             cnt = ""
@@ -157,7 +151,6 @@ class Data:
                 cnt = " ".join(s[self.cnt_ind:])
         except Exception:
             return None, "", 0
-
         return dt, cnt, label
 
 
@@ -180,31 +173,31 @@ _patterns = [
 ]
 _entity_pat = re.compile('|'.join(_patterns))
 
-# 1) camelCase / PascalCase → snake_case
-#    SystemCall → System_Call
-_camel_1 = re.compile(r'([a-z0-9])([A-Z])')       # aB → a_B
-_camel_2 = re.compile(r'([A-Z]+)([A-Z][a-z])')    # ABCd → AB_Cd
+# 1) camelCase / PascalCase -> snake_case
+_camel_1 = re.compile(r'([a-z0-9])([A-Z])')
+_camel_2 = re.compile(r'([A-Z]+)([A-Z][a-z])')
 
-# 2) всё, кроме букв  → пробел
+# 2) всё, кроме букв -> пробел
 _non_alpha = re.compile(r'[^a-zA-Z]+')
 
-# 3) множественные пробелы → один
+# 3) множественные пробелы -> один
 _spaces = re.compile(r'\s+')
 _digits = re.compile(r'\d+')
 
-def normalize_text(s: str) -> str:
-    # 1) вырезаем сущности (IP, MAC, пути, hex, email) → пробел
-    s = _entity_pat.sub(' ', s)
 
+def normalize_text(s: str) -> str:
+    s = _entity_pat.sub(' ', s)
     s = _camel_1.sub(r'\1_\2', s)
     s = _camel_2.sub(r'\1_\2', s)
     s = _digits.sub(r' N ', s)
-    s = _non_alpha.sub(' ', s)   # цифры, [, ], (, ), ., :, /, \, -, _ → пробел
+    s = _non_alpha.sub(' ', s)
     s = s.lower()
     s = _spaces.sub(' ', s).strip()
     return s
 
+
 import io
+
 
 class SuperComputerDataset(Dataset):
     def __init__(
@@ -223,13 +216,15 @@ class SuperComputerDataset(Dataset):
             raise ValueError
 
         self.max_lines = self.source.max_lines
+        self.start_line = self.source.start_line
+        self.end_line = self.source.end_line
         self.n = n
         self.window_size = source.window_size
         self.step_size = source.step_size
         self.train_ratio = train_ratio
 
         self.line_positions: list[int] = []  # позиции строк 0, n, 2n, ...
-        self.labels_list: list[int] = []  # метка для каждой строки
+        self.labels_list: list[int] = []      # метка для каждой строки
         self.total_lines = 0
         self._num_samples: int = 0
 
@@ -238,13 +233,27 @@ class SuperComputerDataset(Dataset):
         self.file: typing.Optional[io.BufferedReader] = None
 
     def _build_index(self) -> None:
+        # сколько строк читать максимум (None = без ограничения)
+        max_read = None if math.isinf(self.max_lines) else int(self.max_lines)
+
         line_idx = 0
         with open(self.filepath, "rb") as f:
+            # пропустить start_line строк в начале
+            for _ in range(self.start_line):
+                if not f.readline():
+                    break
+
             while True:
+                # условие по end_line (абсолютный номер в файле)
+                if self.end_line is not None and (self.start_line + line_idx) >= self.end_line:
+                    break
+                # условие по max_lines (относительное от start_line)
+                if max_read is not None and line_idx >= max_read:
+                    break
+
                 pos = f.tell()
                 raw = f.readline()
-
-                if not raw or (line_idx >= self.max_lines):
+                if not raw:
                     break
 
                 if line_idx % self.n == 0:
@@ -252,24 +261,25 @@ class SuperComputerDataset(Dataset):
 
                 line = raw.decode("latin-1", errors="replace")
                 self.labels_list.append(self.source.get_time_content_label(line)[2])
-
-
                 line_idx += 1
 
         self.total_lines = line_idx
 
+        # диагностика диапазона
+        end_display = self.start_line + self.total_lines
+        print(f"[data] read [{self.start_line}, {end_display}) = "
+              f"{self.total_lines} lines "
+              f"(max_lines={self.max_lines}, end_line={self.end_line})")
+
         if self.total_lines < self.window_size:
             total_samples = 0
         else:
-            total_samples = (
-                    (self.total_lines - self.window_size) // self.step_size + 1
-            )
+            total_samples = (self.total_lines - self.window_size) // self.step_size + 1
 
         self._num_samples = int(total_samples * self.train_ratio)
 
     def __getitem__(self, start_line: typing.Union[int, np.ndarray]) -> tuple[list, list, list, int]:
         if isinstance(start_line, np.ndarray):
-            # 0d or scalar array
             start_line = start_line.item()
 
         if self.file is None:
@@ -277,7 +287,6 @@ class SuperComputerDataset(Dataset):
         self.file = typing.cast(io.BufferedReader, self.file)
 
         if start_line < 0 or start_line >= self.total_lines:
-            # последнее окно может быть не полным
             raise IndexError(start_line)
 
         anchor_idx = start_line // self.n
@@ -288,6 +297,7 @@ class SuperComputerDataset(Dataset):
         for _ in range(skip_lines):
             if not self.file.readline():
                 return [], [], [], 0
+
         window = []
         window_times = []
         window_raws = []
@@ -308,9 +318,6 @@ class SuperComputerDataset(Dataset):
     def __len__(self):
         return max(0, self.total_lines - self.window_size + 1)
 
-import math
-import typing
-from torch.utils.data import IterableDataset
 
 class EvaluationDataset(IterableDataset):
     def __init__(self, train_dataset: SuperComputerDataset):
@@ -339,33 +346,27 @@ class EvaluationDataset(IterableDataset):
         for start in range(self.start_line, last_possible_start + 1, self.step_size):
             yield self.train_dataset[start]
 
-import datetime
-import typing
-import os
 
-
-# gzip_fp -> extract_dir/data_dir/data_dir.log
-# источник всех датасетов https://www.usenix.org/cfdr-data
-# вместо логхаба
 class BGL(Data):
-    def __init__(self, window_size:int, step_size:int, max_lines:float=math.inf,
+    def __init__(self, window_size: int, step_size: int, max_lines: float = math.inf,
+                 start_line: int = 0, end_line: typing.Optional[int] = None,
                  use_in_colab: bool = True):
         url = r'http://0b4af6cdc2f0c5998459-c0245c5c937c5dedcca3f1764ecc9b2f.r43.cf2.rackcdn.com/hpc4/bgl2.gz'
-        super().__init__(url, dataset_dir='bgl', use_in_colab=use_in_colab, window_size=window_size,
-                         step_size=step_size, max_lines=max_lines)
+        super().__init__(url, dataset_dir='bgl', use_in_colab=use_in_colab,
+                         window_size=window_size, step_size=step_size,
+                         max_lines=max_lines, start_line=start_line, end_line=end_line)
 
         log_format = '<Label> <Id> <Date> <Code1> <Time> <Code2> <Component1> <Component2> <Level> <Content>'.split()
         self.cnt_ind = log_format.index("<Content>")
         self.path_to_log_dir = os.path.join(self.extract_dir, self.dataset_dir)
         self.path_to_log = os.path.join(self.path_to_log_dir, self.dataset_dir + ".log")
 
-
-    def get_time_content_label(self, raw_log: str) -> tuple[typing.Optional[datetime.datetime],
-    str, int]:
+    def get_time_content_label(self, raw_log: str) -> tuple[typing.Optional[datetime.datetime], str, int]:
         s = raw_log.split()
         label = 1
         try:
-            if s[0] == "-": label = 0
+            if s[0] == "-":
+                label = 0
             t = s[4]
             dt = datetime.datetime.strptime(t, "%Y-%m-%d-%H.%M.%S.%f")
             cnt = ""
@@ -373,38 +374,35 @@ class BGL(Data):
                 cnt = " ".join(s[self.cnt_ind:])
         except Exception:
             return None, "", 0
-
         return dt, cnt, label
 
 
 class Tbird(Data):
-    def __init__(self, window_size:int, step_size:int, max_lines:float=math.inf,
+    def __init__(self, window_size: int, step_size: int, max_lines: float = math.inf,
+                 start_line: int = 0, end_line: typing.Optional[int] = None,
                  use_in_colab: bool = True):
         url = r'http://0b4af6cdc2f0c5998459-c0245c5c937c5dedcca3f1764ecc9b2f.r43.cf2.rackcdn.com/hpc4/tbird2.gz'
-        super().__init__(url, dataset_dir='tbird', use_in_colab=use_in_colab, window_size=window_size,
-                         step_size=step_size, max_lines=max_lines)
+        super().__init__(url, dataset_dir='tbird', use_in_colab=use_in_colab,
+                         window_size=window_size, step_size=step_size,
+                         max_lines=max_lines, start_line=start_line, end_line=end_line)
 
-        log_format = '<Label> <Id> <Date> <Admin> <Month> <Day> <Time> <AdminAddr> <Content>'.split()   #thunderbird  , spirit, liberty
+        log_format = '<Label> <Id> <Date> <Admin> <Month> <Day> <Time> <AdminAddr> <Content>'.split()
         self.cnt_ind = log_format.index("<Content>")
-
         self.path_to_log_dir = os.path.join(self.extract_dir, self.dataset_dir)
         self.path_to_log = os.path.join(self.path_to_log_dir, self.dataset_dir + ".log")
 
-    def get_time_content_label(self, raw_log: str) -> tuple[typing.Optional[datetime.datetime],
-        str, int]:
+    def get_time_content_label(self, raw_log: str) -> tuple[typing.Optional[datetime.datetime], str, int]:
         res = super().get_time_content_label(raw_log)
-        if res[0] is not None: return res
+        if res[0] is not None:
+            return res
         s = raw_log.split()
         label = 1
         try:
             if s[0] == "-":
                 label = 0
-            # формат: <Label> <Id> <Date> <Admin> <Month> <Day> <Time> <AdminAddr> <Content>
-            date_str = s[2]  # "2005.06.03"
-            time_str = s[6]  # "01:00:00"
-            dt = datetime.datetime.strptime(
-                f"{date_str} {time_str}", "%Y.%m.%d %H:%M:%S"
-            )
+            date_str = s[2]
+            time_str = s[6]
+            dt = datetime.datetime.strptime(f"{date_str} {time_str}", "%Y.%m.%d %H:%M:%S")
             cnt = " ".join(s[self.cnt_ind:]) if len(s) > self.cnt_ind else ""
         except Exception:
             return None, "", 0
@@ -412,73 +410,68 @@ class Tbird(Data):
 
 
 class Spirit(Data):
-    def __init__(self, window_size:int, step_size:int, max_lines:float=math.inf,
+    def __init__(self, window_size: int, step_size: int, max_lines: float = math.inf,
+                 start_line: int = 0, end_line: typing.Optional[int] = None,
                  use_in_colab: bool = True):
         url = r'http://0b4af6cdc2f0c5998459-c0245c5c937c5dedcca3f1764ecc9b2f.r43.cf2.rackcdn.com/hpc4/spirit2.gz'
-        super().__init__(url, dataset_dir='spirit', use_in_colab=use_in_colab, window_size=window_size,
-                         step_size=step_size, max_lines=max_lines)
+        super().__init__(url, dataset_dir='spirit', use_in_colab=use_in_colab,
+                         window_size=window_size, step_size=step_size,
+                         max_lines=max_lines, start_line=start_line, end_line=end_line)
 
         log_format = '<Label> <Id> <Date> <Admin> <Month> <Day> <Time> <AdminAddr> <Content>'.split()
         self.cnt_ind = log_format.index("<Content>")
-
         self.path_to_log_dir = os.path.join(self.extract_dir, self.dataset_dir)
         self.path_to_log = os.path.join(self.path_to_log_dir, self.dataset_dir + ".log")
 
-    def get_time_content_label(self, raw_log: str) -> tuple[typing.Optional[datetime.datetime],
-        str, int]:
+    def get_time_content_label(self, raw_log: str) -> tuple[typing.Optional[datetime.datetime], str, int]:
         res = super().get_time_content_label(raw_log)
-        if res[0] is not None: return res
+        if res[0] is not None:
+            return res
         s = raw_log.split()
         label = 1
         try:
             if s[0] == "-":
                 label = 0
-            # формат: <Label> <Id> <Date> <Admin> <Month> <Day> <Time> <AdminAddr> <Content>
-            date_str = s[2]  # "2005.06.03"
-            time_str = s[6]  # "01:00:00"
-            dt = datetime.datetime.strptime(
-                f"{date_str} {time_str}", "%Y.%m.%d %H:%M:%S"
-            )
+            date_str = s[2]
+            time_str = s[6]
+            dt = datetime.datetime.strptime(f"{date_str} {time_str}", "%Y.%m.%d %H:%M:%S")
             cnt = " ".join(s[self.cnt_ind:]) if len(s) > self.cnt_ind else ""
         except Exception:
             return None, "", 0
         return dt, cnt, label
+
 
 class Liberty(Data):
-    def __init__(self, window_size:int, step_size:int, max_lines:float=math.inf,
+    def __init__(self, window_size: int, step_size: int, max_lines: float = math.inf,
+                 start_line: int = 0, end_line: typing.Optional[int] = None,
                  use_in_colab: bool = True):
         url = r'http://0b4af6cdc2f0c5998459-c0245c5c937c5dedcca3f1764ecc9b2f.r43.cf2.rackcdn.com/hpc4/liberty2.gz'
-        super().__init__(url, dataset_dir='liberty', use_in_colab=use_in_colab, window_size=window_size,
-                         step_size=step_size, max_lines=max_lines)
+        super().__init__(url, dataset_dir='liberty', use_in_colab=use_in_colab,
+                         window_size=window_size, step_size=step_size,
+                         max_lines=max_lines, start_line=start_line, end_line=end_line)
 
         log_format = '<Label> <Id> <Date> <Admin> <Month> <Day> <Time> <AdminAddr> <Content>'.split()
         self.cnt_ind = log_format.index("<Content>")
-
         self.path_to_log_dir = os.path.join(self.extract_dir, self.dataset_dir)
         self.path_to_log = os.path.join(self.path_to_log_dir, self.dataset_dir + ".log")
 
-    def get_time_content_label(self, raw_log: str) -> tuple[typing.Optional[datetime.datetime],
-        str, int]:
+    def get_time_content_label(self, raw_log: str) -> tuple[typing.Optional[datetime.datetime], str, int]:
         res = super().get_time_content_label(raw_log)
-        if res[0] is not None: return res
+        if res[0] is not None:
+            return res
         s = raw_log.split()
         label = 1
         try:
             if s[0] == "-":
                 label = 0
-            # формат: <Label> <Id> <Date> <Admin> <Month> <Day> <Time> <AdminAddr> <Content>
-            date_str = s[2]  # "2005.06.03"
-            time_str = s[6]  # "01:00:00"
-            dt = datetime.datetime.strptime(
-                f"{date_str} {time_str}", "%Y.%m.%d %H:%M:%S"
-            )
+            date_str = s[2]
+            time_str = s[6]
+            dt = datetime.datetime.strptime(f"{date_str} {time_str}", "%Y.%m.%d %H:%M:%S")
             cnt = " ".join(s[self.cnt_ind:]) if len(s) > self.cnt_ind else ""
         except Exception:
             return None, "", 0
         return dt, cnt, label
 
-
-import numpy as np
 
 class BalancedSampler(Sampler):
     """
@@ -505,8 +498,7 @@ class BalancedSampler(Sampler):
         self.step_size = dataset.step_size
         labels = self.dataset.labels
 
-        all_starts = np.arange(0, self.N - self.W + 1,
-                               self.step_size, dtype=np.int64)
+        all_starts = np.arange(0, self.N - self.W + 1, self.step_size, dtype=np.int64)
         prefix = np.zeros(self.N + 1, dtype=np.int64)
         prefix[1:] = np.cumsum(labels)
         has_anom = (prefix[all_starts + self.W] - prefix[all_starts]) > 0
@@ -525,8 +517,7 @@ class BalancedSampler(Sampler):
         n_min = len(self.minority_indices)
         n_maj = len(self.majority_indices)
 
-        print(f'sampler: GLOBAL a={len(self.anomalous_indices)}, '
-              f'n={len(self.normal_indices)}')
+        print(f'sampler: GLOBAL a={len(self.anomalous_indices)}, n={len(self.normal_indices)}')
         t = n_min + n_maj
         if t > 0:
             print(f'sampler: frac_a={len(self.anomalous_indices)/t*100:.2f}%, '
@@ -539,25 +530,21 @@ class BalancedSampler(Sampler):
             self.minority_count = 0
             self.total_size = n_maj
         elif n_min < self.min_minority_for_balance:
-            print(f"[sampler] WARNING: minority={n_min} < "
-                  f"{self.min_minority_for_balance}. Балансировка отключена.")
-            print(f"[sampler] СОВЕТ: увеличьте train_ratio или "
-                  f"используйте pos_weight в BCE.")
+            print(f"[sampler] WARNING: minority={n_min} < {self.min_minority_for_balance}. "
+                  f"Балансировка отключена.")
+            print(f"[sampler] СОВЕТ: увеличьте train_ratio или используйте pos_weight в BCE.")
             self.balance_enabled = False
             self.minority_count = n_min
             self.total_size = n_min + n_maj
         else:
-            target_minority = int((self.target_ratio * n_maj)
-                                  / (1 - self.target_ratio))
+            target_minority = int((self.target_ratio * n_maj) / (1 - self.target_ratio))
             oversample_cap = int(n_min * self.max_oversample_factor)
-            self.minority_count = max(n_min,
-                                      min(target_minority, oversample_cap))
+            self.minority_count = max(n_min, min(target_minority, oversample_cap))
             self.total_size = self.minority_count + n_maj
             if self.minority_count < target_minority:
                 actual = self.minority_count / self.total_size
                 print(f"[sampler] minority capped: {self.minority_count} "
-                      f"(target был {target_minority}, "
-                      f"cap factor={self.max_oversample_factor}). "
+                      f"(target был {target_minority}, cap factor={self.max_oversample_factor}). "
                       f"Фактический target_ratio={actual:.3f}")
 
         if self.balance_enabled:
@@ -582,8 +569,7 @@ class BalancedSampler(Sampler):
               f"majority={self.total_size - self.minority_count}, "
               f"total={self.total_size}, "
               f"balance={'ON' if self.balance_enabled else 'OFF'}, "
-              f"frac_minority="
-              f"{self.minority_count / max(self.total_size, 1) * 100:.1f}%")
+              f"frac_minority={self.minority_count / max(self.total_size, 1) * 100:.1f}%")
 
         self.seed = seed
         self.rng = None
@@ -609,10 +595,9 @@ class BalancedSampler(Sampler):
         base = self.seed if self.seed is not None else 0
         self.rng = np.random.default_rng(base + (wi.id if wi is not None else 0))
 
-        oversampled_minority = self.sample_count(self.minority_indices,
-                                                  self.minority_count)
+        oversampled_minority = self.sample_count(self.minority_indices, self.minority_count)
         oversampled_majority = self.sample_count(self.majority_indices,
-                                                  self.total_size - self.minority_count)
+                                                 self.total_size - self.minority_count)
         combined = np.concatenate([oversampled_minority, oversampled_majority])
         self.rng.shuffle(combined)
 
