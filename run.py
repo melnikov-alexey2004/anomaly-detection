@@ -269,6 +269,41 @@ def download_folder(repo_id, path_in_repo, local_dir):
                       allow_patterns=[f"{path_in_repo}/**"],
                       local_dir=local_dir)
 
+import torch
+from transformers import AutoModel, AutoConfig
+
+def print_model_layers(model_name: str, max_depth: int = 4, max_show: int = 60):
+    print(f"\n{'='*70}\nModel: {model_name}\n{'='*70}")
+
+    cfg = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+    model = AutoModel.from_pretrained(model_name, config=cfg,
+                                       trust_remote_code=True)
+
+    total = sum(p.numel() for p in model.parameters())
+    print(f"Total parameters: {total:,}")
+    print(f"Hidden size:      {getattr(cfg, 'hidden_size', 'N/A')}")
+    print(f"Num layers:       {getattr(cfg, 'num_hidden_layers', 'N/A')}")
+    print(f"\n{'Layer name':<70} {'Type':<22} {'Shape'}")
+    print("-" * 120)
+
+    layers = []
+    for name, module in model.named_modules():
+        if name.count('.') > max_depth:
+            continue
+        if isinstance(module, (torch.nn.Linear, torch.nn.LayerNorm,
+                                torch.nn.Embedding)):
+            layers.append(name)
+
+    for name in layers[:max_show]:
+        m = dict(model.named_modules())[name]
+        w = getattr(m, 'weight', None)
+        shape = tuple(w.shape) if w is not None else ()
+        print(f"{name:<70} {type(m).__name__:<22} {shape}")
+
+    if len(layers) > max_show:
+        print(f"... и ещё {len(layers) - max_show} слоёв")
+    return model
+# model = print_model_layers("allenai/longformer-base-4096")
 
 # ============================================================
 # train_loop
