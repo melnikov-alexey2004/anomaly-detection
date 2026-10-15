@@ -41,6 +41,173 @@ from model import (
 # Config
 # ============================================================
 
+import torch
+from transformers import AutoModel, AutoConfig
+
+def print_model_layers(model_name: str, max_depth: int = 4, max_show: int = 60):
+    print(f"\n{'='*70}\nModel: {model_name}\n{'='*70}")
+
+    cfg = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+    model = AutoModel.from_pretrained(model_name, config=cfg,
+                                       trust_remote_code=True)
+
+    total = sum(p.numel() for p in model.parameters())
+    print(f"Total parameters: {total:,}")
+    print(f"Hidden size:      {getattr(cfg, 'hidden_size', 'N/A')}")
+    print(f"Num layers:       {getattr(cfg, 'num_hidden_layers', 'N/A')}")
+    print(f"\n{'Layer name':<70} {'Type':<22} {'Shape'}")
+    print("-" * 120)
+
+    layers = []
+    for name, module in model.named_modules():
+        if name.count('.') > max_depth:
+            continue
+        if isinstance(module, (torch.nn.Linear, torch.nn.LayerNorm,
+                                torch.nn.Embedding)):
+            layers.append(name)
+
+    for name in layers[:max_show]:
+        m = dict(model.named_modules())[name]
+        w = getattr(m, 'weight', None)
+        shape = tuple(w.shape) if w is not None else ()
+        print(f"{name:<70} {type(m).__name__:<22} {shape}")
+
+    if len(layers) > max_show:
+        print(f"... и ещё {len(layers) - max_show} слоёв")
+    return model
+
+
+# Использование
+# model = print_model_layers("allenai/longformer-base-4096")
+
+from sentence_transformers import SentenceTransformer
+
+def print_jasper_layers(model_name: str, max_show: int = 40):
+    print(f"\n{'='*70}\nJasper: {model_name}\n{'='*70}")
+
+    st = SentenceTransformer(model_name, trust_remote_code=True,
+                              device="cpu")
+
+    # 1. Собрать все параметры верхнего уровня
+    total = sum(p.numel() for p in st.parameters())
+    trainable = sum(p.numel() for p in st.parameters() if p.requires_grad)
+    print(f"Total parameters:     {total:,}")
+    print(f"Trainable parameters: {trainable:,}  (заморожен? {trainable == 0})")
+    print()
+
+    # 2. Основной энкодер внутри SentenceTransformer
+    inner = st[0] if len(st) > 0 else None
+    print(f"First module: {type(inner).__name__}")
+    if hasattr(inner, 'auto_model'):
+        am = inner.auto_model
+        print(f"  auto_model: {type(am).__name__}")
+        print(f"  hidden_size: {am.config.hidden_size}")
+        print(f"  num_layers:  {am.config.num_hidden_layers}")
+
+        # 3. Слои внутренней модели
+        print(f"\n{'Layer name':<70} {'Type':<22} {'Shape'}")
+        print("-" * 120)
+        count = 0
+        for name, module in am.named_modules():
+            if isinstance(module, torch.nn.Linear) and count < max_show:
+                w = getattr(module, 'weight', None)
+                shape = tuple(w.shape) if w is not None else ()
+                print(f"{name:<70} {type(module).__name__:<22} {shape}")
+                count += 1
+
+    return st
+# st = print_jasper_layers("infgrad/Jasper-Token-Compression-600M")
+
+import torch, torch.nn as nn
+
+
+def print_custom_model_layers(model, max_depth: int = 4, max_show: int = 60):
+    print(f"\n{'='*70}\nModel: {type(model).__name__}\n{'='*70}")
+
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Total parameters:     {total:,}")
+    print(f"Trainable parameters: {trainable:,}  "
+          f"({trainable/total*100:.2f}%)")
+    print(f"\n{'Layer name':<70} {'Type':<22} {'Shape'}")
+    print("-" * 120)
+
+    layers = []
+    for name, module in model.named_modules():
+        if name.count('.') > max_depth:
+            continue
+        if isinstance(module, (torch.nn.Linear, torch.nn.LayerNorm,
+                                torch.nn.Embedding, torch.nn.GRU,
+                                torch.nn.LSTM, torch.nn.MultiheadAttention,
+                                torch.nn.Conv1d, torch.nn.Conv2d)):
+            layers.append(name)
+
+    for name in layers[:max_show]:
+        m = dict(model.named_modules())[name]
+        w = getattr(m, 'weight', None)
+        shape = tuple(w.shape) if w is not None else ()
+        print(f"{name:<70} {type(m).__name__:<22} {shape}")
+
+    if len(layers) > max_show:
+        print(f"... и ещё {len(layers) - max_show} слоёв")
+    return model
+
+
+# Пример для GRUAttentionModel
+# print_custom_model_layers(model)
+
+def inspect_model(model, max_depth: int = 4, max_show: int = 60):
+    """
+    Универсальный осмотр: Longformer/RoBERTa/кастом/Jasper.
+    """
+    from transformers import PreTrainedModel
+
+    # Jasper-обёртка: разворачиваем
+    try:
+        from sentence_transformers import SentenceTransformer
+        if isinstance(model, SentenceTransformer):
+            print(f"[inspect] SentenceTransformer, разворачиваем в auto_model")
+            for m in model:
+                if hasattr(m, 'auto_model'):
+                    model = m.auto_model
+                    break
+    except Exception:
+        pass
+
+    # Longformer/RoBERTa/любой HF
+    if isinstance(model, PreTrainedModel):
+        print(f"[inspect] HF model: {type(model).__name__}")
+        cfg = model.config
+        print(f"  hidden_size: {getattr(cfg, 'hidden_size', 'N/A')}")
+        print(f"  num_layers:  {getattr(cfg, 'num_hidden_layers', 'N/A')}")
+
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"  total params:     {total:,}")
+    print(f"  trainable params: {trainable:,} ({trainable/total*100:.2f}%)")
+
+    print(f"\n{'Layer name':<70} {'Type':<22} {'Shape'}")
+    print("-" * 120)
+
+    layers = []
+    for name, module in model.named_modules():
+        if name.count('.') > max_depth:
+            continue
+        if isinstance(module, (torch.nn.Linear, torch.nn.LayerNorm,
+                                torch.nn.Embedding, torch.nn.GRU,
+                                torch.nn.LSTM, torch.nn.MultiheadAttention)):
+            layers.append(name)
+
+    for name in layers[:max_show]:
+        m = dict(model.named_modules())[name]
+        w = getattr(m, 'weight', None)
+        shape = tuple(w.shape) if w is not None else ()
+        print(f"{name:<70} {type(m).__name__:<22} {shape}")
+
+    if len(layers) > max_show:
+        print(f"... и ещё {len(layers) - max_show}")
+    return model
+
 @dataclasses.dataclass
 class Config:
     # ---------- данные ----------
