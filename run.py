@@ -33,7 +33,7 @@ from model import (
     LogAnomalyModel, EncoderSpec,
     evaluate, collect_predictions,
     save_trainable, load_adapter_into,
-    resolve_dtype,
+    resolve_dtype, make_raw_collate_fn, pack_batch
 )
 
 
@@ -458,7 +458,8 @@ def train_loop(model, optimizer, scheduler, train_loader,
         t0 = time.time()
 
         pbar = tqdm.tqdm(train_loader, desc=f"epoch {epoch}", leave=True)
-        for step, batch in enumerate(pbar):
+        for step, raw_batch in enumerate(pbar):
+            batch = pack_batch(raw_batch, line_cache, device)
             if batch is None:
                 continue
             log_embs = batch["log_embs"].to(device)
@@ -502,7 +503,7 @@ def train_loop(model, optimizer, scheduler, train_loader,
             })
 
             if cfg.metrics_log_every and (step + 1) % cfg.metrics_log_every == 0:
-                ev = evaluate(model, val_loader_small, device, criterion,
+                ev = evaluate(model, val_loader_small, device, criterion, line_cache,
                               max_windows=cfg.eval_max_windows)
                 rec = {
                     "run_tag": cfg.run_tag,
@@ -526,7 +527,7 @@ def train_loop(model, optimizer, scheduler, train_loader,
                       f"n={ev['n_windows']}")
                 model.train()
 
-        ev = evaluate(model, val_loader_small, device, criterion,
+        ev = evaluate(model, val_loader_small, device, criterion, line_cache,
                       max_windows=cfg.eval_max_windows)
         rec = {
             "run_tag": cfg.run_tag,
@@ -567,7 +568,7 @@ def train_loop(model, optimizer, scheduler, train_loader,
                               epoch=epoch, phase="epoch")
 
     if cfg.final_full_eval:
-        ev = evaluate(model, val_loader_full, device, criterion,
+        ev = evaluate(model, val_loader_full, device, criterion, line_cache,
                       max_windows=None, desc="final full eval")
         rec = {
             "run_tag": cfg.run_tag,
@@ -622,7 +623,7 @@ def _log_zone_distribution(base_sampler, safe_min, safe_max, name="zone"):
 
 
 def _build_loaders(ds, val_ds, cfg, line_cache, base_sampler=None):
-    collate = make_collate_fn(line_cache)
+    collate = make_raw_collate_fn()
     val_loader_small = DataLoader(
         LimitedIterable(val_ds, cfg.eval_max_windows),
         batch_size=cfg.batch_size, shuffle=False,
@@ -662,7 +663,7 @@ def _build_train_loader(ds, eval_start_line, cfg, line_cache,
 
     train_sampler = FilteredSampler(base_sampler, max_start=safe_max,
                                      min_start=safe_min)
-    collate = make_collate_fn(line_cache)
+    collate = make_raw_collate_fn()
     train_loader = DataLoader(
         ds, batch_size=cfg.batch_size, sampler=train_sampler,
         collate_fn=collate, num_workers=cfg.num_workers)
@@ -713,7 +714,7 @@ def _save_predictions(model, ds, train_loader, val_loader,
     os.makedirs(cfg.predictions_dir, exist_ok=True)
 
     print(f"[pred] collecting eval (phase={phase})...")
-    ev = collect_predictions(model, val_loader, device, desc="pred eval")
+    ev = collect_predictions(model, val_loader, device, line_cache, desc="pred eval")
     eval_path = os.path.join(cfg.predictions_dir,
                              f"pred_{cfg.run_tag}_eval.npz")
     np.savez_compressed(
@@ -734,7 +735,7 @@ def _save_predictions(model, ds, train_loader, val_loader,
         ds, batch_size=cfg.batch_size, sampler=train_sampler,
         collate_fn=collate, num_workers=cfg.num_workers)
     print(f"[pred] collecting train on {len(train_sampler)} unique windows...")
-    tr = collect_predictions(model, train_unique_loader, device,
+    tr = collect_predictions(model, train_unique_loader, device, line_cache,
                              desc="pred train")
     train_path = os.path.join(cfg.predictions_dir,
                               f"pred_{cfg.run_tag}_train.npz")

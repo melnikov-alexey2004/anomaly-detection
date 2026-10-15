@@ -171,6 +171,14 @@ class LineEmbeddingCache:
         return (f"cache size={len(self.cache)}/{self.max_lines} "
                 f"hits={self.hits} misses={self.misses} hit_rate={hr:.1f}%")
 
+def make_raw_collate_fn():
+    """
+    Просто возвращает список кортежей от Dataset. Никакого Jasper,
+    никаких тензоров — это выполняется в воркерах DataLoader.
+    """
+    def collate(batch):
+        return list(batch)   # [(window, times, raws, label), ...]
+    return collate
 
 def make_collate_fn(cache: LineEmbeddingCache):
     def collate(batch):
@@ -202,7 +210,50 @@ def make_collate_fn(cache: LineEmbeddingCache):
         }
     return collate
 
+def pack_batch(batch, cache: "LineEmbeddingCache", device):
+    """
+    Выполняется в главном процессе.
+    batch: list[(window, times, raws, label)]
+    Возвращает dict с тензорами на device или None.
+    """
+    windows, times_list, labels = [], [], []
+    for window, window_times, _raws, label in batch:
+        if not window:
+            continue
+        windows.append(window)
+        times_list.append(window_times)
+        labels.append(float(label))
 
+    if not windows:
+        return None
+
+    # Один вызов Jasper — сразу на все окна батча
+    all_lines = [line for w in windows for line in w]
+    all_embs = cache.get_batch(all_lines)            # [Σ, D] CPU bf16
+
+    # Разбить обратно по окнам
+    window_embs = []
+    idx = 0
+    for w in windows:
+        n = len(w)
+        window_embs.append(all_embs[idx:idx + n])
+        idx += n
+
+    max_len = max(e.shape[0] for e in window_embs)
+    D = window_embs[0].shape[1]
+    padded = torch.zeros(len(window_embs), max_len, D, dtype=torch.bfloat16)
+    mask = torch.zeros(len(window_embs), max_len, dtype=torch.long)
+    for i, e in enumerate(window_embs):
+        n = e.shape[0]
+        padded[i, :n] = e
+        mask[i, :n] = 1
+
+    return {
+        "log_embs": padded,
+        "attention_mask": mask,
+        "times": times_list,
+        "labels": torch.tensor(labels, dtype=torch.float32),
+    }
 # ============================================================
 # 4. Проектор Jasper -> Longformer
 # ============================================================
@@ -548,17 +599,18 @@ class LogAnomalyModel(nn.Module):
 # ============================================================
 
 @torch.no_grad()
-def evaluate(model, loader, device, criterion,
-             max_windows=None, max_batches=None,
-             desc: str = "eval") -> dict:
+def evaluate(model, loader, device, criterion, line_cache,
+             max_windows=None, max_batches=None, desc="eval") -> dict:
     model.eval()
     losses, probs, ys = [], [], []
     n_seen = 0
 
     pbar = tqdm.tqdm(loader, desc=desc, leave=False)
-    for i, batch in enumerate(pbar):
-        if max_batches is not None and i >= max_batches:
+    for step, raw_batch in enumerate(pbar):
+        if max_batches is not None and step >= max_batches:
             break
+
+        batch = pack_batch(raw_batch, line_cache, device)
         if batch is None:
             continue
 
@@ -612,12 +664,14 @@ def evaluate(model, loader, device, criterion,
 # ============================================================
 
 @torch.no_grad()
-def collect_predictions(model, loader, device, desc="collect") -> dict:
+def collect_predictions(model, loader, device, line_cache, desc="collect") -> dict:
     model.eval()
     all_logits, all_probs, all_bce, all_labels = [], [], [], []
 
     pbar = tqdm.tqdm(loader, desc=desc, leave=False)
-    for batch in pbar:
+    for raw_batch in pbar:
+        batch = pack_batch(raw_batch, line_cache, device)
+
         if batch is None:
             continue
         log_embs = batch["log_embs"].to(device)
