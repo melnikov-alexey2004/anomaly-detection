@@ -305,6 +305,45 @@ def print_model_layers(model_name: str, max_depth: int = 4, max_show: int = 60):
     return model
 # model = print_model_layers("allenai/longformer-base-4096")
 
+from sentence_transformers import SentenceTransformer
+
+def print_jasper_layers(model_name: str, max_show: int = 40):
+    print(f"\n{'='*70}\nJasper: {model_name}\n{'='*70}")
+
+    st = SentenceTransformer(model_name, trust_remote_code=True,
+                              device="cpu")
+
+    # 1. Собрать все параметры верхнего уровня
+    total = sum(p.numel() for p in st.parameters())
+    trainable = sum(p.numel() for p in st.parameters() if p.requires_grad)
+    print(f"Total parameters:     {total:,}")
+    print(f"Trainable parameters: {trainable:,}  (заморожен? {trainable == 0})")
+    print()
+
+    # 2. Основной энкодер внутри SentenceTransformer
+    inner = st[0] if len(st) > 0 else None
+    print(f"First module: {type(inner).__name__}")
+    if hasattr(inner, 'auto_model'):
+        am = inner.auto_model
+        print(f"  auto_model: {type(am).__name__}")
+        print(f"  hidden_size: {am.config.hidden_size}")
+        print(f"  num_layers:  {am.config.num_hidden_layers}")
+
+        # 3. Слои внутренней модели
+        print(f"\n{'Layer name':<70} {'Type':<22} {'Shape'}")
+        print("-" * 120)
+        count = 0
+        for name, module in am.named_modules():
+            if isinstance(module, torch.nn.Linear) and count < max_show:
+                w = getattr(module, 'weight', None)
+                shape = tuple(w.shape) if w is not None else ()
+                print(f"{name:<70} {type(module).__name__:<22} {shape}")
+                count += 1
+
+    return st
+# st = print_jasper_layers("infgrad/Jasper-Token-Compression-600M")
+
+
 # ============================================================
 # train_loop
 # ============================================================
