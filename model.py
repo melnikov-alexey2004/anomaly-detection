@@ -19,10 +19,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from transformers import (
-    LongformerModel, LongformerConfig, BitsAndBytesConfig, PeftConfig,
+    LongformerModel, LongformerConfig, BitsAndBytesConfig,
 )
 from peft import (
     LoraConfig, get_peft_model, PeftModel, TaskType,
+    PeftConfig,
 )
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics import precision_recall_fscore_support
