@@ -1,6 +1,6 @@
 """
 Ядро: временные признаки, Jasper, кэш эмбеддингов, проектор, агрегатор,
-энкодер (Longformer + LoRA) + опциональная квантизация + FP8, метрики,
+энкодер (Longformer + PEFT) + опциональная квантизация + FP8, метрики,
 save/load, сбор предсказаний.
 """
 import os
@@ -227,7 +227,7 @@ class LogProjector(nn.Module):
 
 
 # ============================================================
-# 5. Агрегатор по слоям
+# 5. Агрегатор
 # ============================================================
 
 class LayerAggregator(nn.Module):
@@ -270,7 +270,7 @@ _DTYPE_MAP = {
     "bf16": torch.bfloat16,
     "fp16": torch.float16,
     "fp32": torch.float32,
-    "tf32": torch.float32,   # tf32 — это флаг, веса в fp32
+    "tf32": torch.float32,
 }
 
 
@@ -289,7 +289,6 @@ def _enable_tf32_if_needed(cfg):
 
 
 def _apply_fp8(model, cfg):
-    """FP8 через torchao. Работает только на Ada/Hopper/Blackwell."""
     backend = cfg.fp8_backend.lower()
     if backend == "torchao":
         try:
@@ -297,30 +296,26 @@ def _apply_fp8(model, cfg):
                                         Float8LinearConfig)
         except Exception as e:
             raise RuntimeError(
-                f"torchao FP8 недоступен: {e}. Установите torchao: "
-                f"pip install torchao"
-            )
+                f"torchao FP8 недоступен: {e}. pip install torchao")
         try:
             f8_cfg = Float8LinearConfig.from_recipe_name(cfg.fp8_recipe)
         except Exception:
             f8_cfg = Float8LinearConfig.from_recipe_name("rowwise")
         convert_to_float8_training(model, config=f8_cfg)
-        print(f"[fp8] torchao recipe={cfg.fp8_recipe} applied to Linear layers")
+        print(f"[fp8] torchao recipe={cfg.fp8_recipe} applied")
         return model
     if backend == "transformer_engine":
-        print("[fp8] transformer_engine selected (managed by accelerate "
-              "mixed_precision='fp8')")
+        print("[fp8] transformer_engine selected (managed by accelerate)")
         return model
     raise ValueError(f"unknown fp8_backend={backend}")
 
 
 # ============================================================
-# 7. EncoderSpec + фабрика энкодеров
+# 7. EncoderSpec + фабрика
 # ============================================================
 
 @dataclasses.dataclass
 class EncoderSpec:
-    """Универсальное описание энкодера."""
     module: nn.Module
     hidden_size: int
     num_layers: int
@@ -331,10 +326,6 @@ class EncoderSpec:
 
 
 def _resolve_peft_config(cfg) -> PeftConfig:
-    """
-    Возвращает cfg.peft_config. Падает, если он None.
-    Никаких неявных LoraConfig(...) из отдельных полей.
-    """
     if getattr(cfg, "peft_config", None) is None:
         raise ValueError(
             "cfg.peft_config is None.\n"
@@ -343,13 +334,12 @@ def _resolve_peft_config(cfg) -> PeftConfig:
             "    cfg = Config(..., peft_config=LoraConfig(\n"
             "        task_type=TaskType.FEATURE_EXTRACTION,\n"
             "        r=32, lora_alpha=32, lora_dropout=0.1,\n"
-            "        target_modules=['query', 'key', 'value', 'dense']))"
+            "        target_modules=['query','key','value','dense']))"
         )
     pc = cfg.peft_config
     if isinstance(pc, LoraConfig) and getattr(pc, "target_modules", None) is None:
-        print("[peft] WARN: LoraConfig без target_modules — PEFT будет "
-              "угадывать по типу модели. Для Longformer это скорее всего "
-              "ничего не даст. Укажите target_modules явно.")
+        print("[peft] WARN: LoraConfig без target_modules — "
+              "укажите явно для Longformer.")
     print(f"[peft] {type(pc).__name__} | task={pc.task_type}")
     return pc
 
@@ -359,19 +349,19 @@ def _build_longformer_encoder(cfg, device: torch.device) -> EncoderSpec:
 
     lf_cfg = LongformerConfig.from_pretrained(cfg.longformer_model_name)
     lf_cfg.num_hidden_layers = cfg.longformer_layers
-    lf_cfg.attention_window = [cfg.longformer_attention_window] * cfg.longformer_layers
+    lf_cfg.attention_window = [cfg.longformer_attention_window] \
+        * cfg.longformer_layers
 
     kwargs = dict(config=lf_cfg)
 
     if cfg.quantization_config is not None:
         if cfg.fp8_training:
             raise ValueError(
-                "quantization_config и fp8_training несовместимы. "
-                "Оставьте только одно."
-            )
+                "quantization_config и fp8_training несовместимы.")
         kwargs["quantization_config"] = cfg.quantization_config
-        kwargs["device_map"] = {"": device.index if device.index is not None else 0}
-        print(f"[encoder] bnb quant enabled (dtype for compute is set by bnb)")
+        kwargs["device_map"] = {
+            "": device.index if device.index is not None else 0}
+        print(f"[encoder] bnb quant enabled")
     else:
         kwargs["torch_dtype"] = resolve_dtype(cfg)
         print(f"[encoder] dtype={cfg.model_dtype}")
@@ -403,25 +393,16 @@ _ENCODER_BUILDERS = {
 
 
 def build_encoder(cfg, device: torch.device) -> EncoderSpec:
-    """
-    Единая точка сборки энкодера. Приоритеты:
-      1. cfg.encoder_factory — пользовательская фабрика
-      2. cfg.encoder_type    — зарегистрированный тип
-    """
     if getattr(cfg, "encoder_factory", None) is not None:
         print("[encoder] using custom encoder_factory")
         spec = cfg.encoder_factory(cfg, device)
-        assert isinstance(spec, EncoderSpec), \
-            "encoder_factory must return EncoderSpec"
+        assert isinstance(spec, EncoderSpec)
         return spec
-
     etype = getattr(cfg, "encoder_type", "longformer")
     if etype not in _ENCODER_BUILDERS:
         raise ValueError(
             f"Unknown encoder_type '{etype}'. "
-            f"Available: {list(_ENCODER_BUILDERS.keys())}, "
-            f"or pass encoder_factory."
-        )
+            f"Available: {list(_ENCODER_BUILDERS.keys())}")
     return _ENCODER_BUILDERS[etype](cfg, device)
 
 
@@ -436,20 +417,20 @@ class LogAnomalyModel(nn.Module):
 
         self.spec = build_encoder(cfg, device)
         self.encoder = self.spec.module
-        self.longformer = self.encoder   # алиас для save/load
+        self.longformer = self.encoder
 
         lf_hidden = self.spec.hidden_size
         self.lf_hidden = lf_hidden
 
         self.projector = LogProjector(jasper_dim, lf_hidden)
         self.aggregator = LayerAggregator(
-            lf_hidden, k=cfg.aggregate_layers, mode=cfg.aggregate_mode,
-        )
+            lf_hidden, k=cfg.aggregate_layers, mode=cfg.aggregate_mode)
         self.time2vec = Time2Vec(cfg.time_emb_len) if cfg.use_time2vec else None
 
         self.use_cls = cfg.use_learned_cls
         if self.use_cls:
-            self.cls_emb = nn.Parameter(torch.randn(1, 1, lf_hidden) * 0.02)
+            self.cls_emb = nn.Parameter(
+                torch.randn(1, 1, lf_hidden) * 0.02)
 
         time_dim = (cfg.time_emb_len + 1) if cfg.use_time2vec else 0
         cyclic_dim = 10 if cfg.use_cyclic_time else 0
@@ -479,16 +460,15 @@ class LogAnomalyModel(nn.Module):
         own = dict(self.named_parameters())
         for name, tensor in sd.items():
             if name not in own:
-                print(f"[load_head] пропущено (нет в модели): {name}")
+                print(f"[load_head] пропущено: {name}")
                 continue
             if own[name].shape != tensor.shape:
                 raise RuntimeError(
-                    f"[load_head] shape mismatch для {name}: "
+                    f"[load_head] shape mismatch {name}: "
                     f"ckpt {tuple(tensor.shape)} vs "
-                    f"model {tuple(own[name].shape)}."
-                )
+                    f"model {tuple(own[name].shape)}")
             own[name].data.copy_(tensor.to(own[name].device,
-                                           dtype=own[name].dtype))
+                                            dtype=own[name].dtype))
 
     def forward(self, log_embs, times, attention_mask):
         target_dtype = next(self.projector.parameters()).dtype
@@ -500,7 +480,8 @@ class LogAnomalyModel(nn.Module):
         if self.use_cls:
             cls = self.cls_emb.expand(B, -1, -1).to(x.dtype)
             x = torch.cat([cls, x], dim=1)
-            ones = torch.ones(B, 1, dtype=attention_mask.dtype, device=x.device)
+            ones = torch.ones(B, 1, dtype=attention_mask.dtype,
+                              device=x.device)
             attention_mask = torch.cat([ones, attention_mask], dim=1)
 
         original_len = attention_mask.shape[1]
@@ -538,13 +519,15 @@ class LogAnomalyModel(nn.Module):
         time_feats = []
         for b in range(B):
             t_list = times[b]
-            delta = time_delta_features(t_list).to(pooled.device, pooled.dtype)
+            delta = time_delta_features(t_list).to(pooled.device,
+                                                    pooled.dtype)
             parts = []
             if self.time2vec is not None:
                 t2v = self.time2vec(delta.squeeze(-1))
                 parts.append(t2v.mean(dim=0))
             if self.cfg.use_cyclic_time:
-                cyc = cyclic_time_features(t_list).to(pooled.device, pooled.dtype)
+                cyc = cyclic_time_features(t_list).to(pooled.device,
+                                                       pooled.dtype)
                 parts.append(cyc.mean(dim=0))
             parts.append(delta.mean(dim=0))
             if getattr(self.cfg, "use_time_present", False):
@@ -625,17 +608,11 @@ def evaluate(model, loader, device, criterion,
 
 
 # ============================================================
-# 10. Сбор предсказаний
+# 10. Collect predictions
 # ============================================================
 
 @torch.no_grad()
-def collect_predictions(model, loader, device,
-                        desc: str = "collect") -> dict:
-    """
-    Прогоняет модель по loader и собирает для каждого окна:
-      logits, probs, bce, labels
-    Порогов не выбирает, метрик не считает.
-    """
+def collect_predictions(model, loader, device, desc="collect") -> dict:
     model.eval()
     all_logits, all_probs, all_bce, all_labels = [], [], [], []
 
@@ -671,7 +648,7 @@ def collect_predictions(model, loader, device,
 
 
 # ============================================================
-# 11. Save / load trainable state
+# 11. Save / load
 # ============================================================
 
 def save_trainable(model, optimizer, scheduler, epoch, global_step, save_dir):
@@ -685,10 +662,12 @@ def save_trainable(model, optimizer, scheduler, epoch, global_step, save_dir):
                    os.path.join(save_dir, "encoder.pt"))
         mode = "full"
     else:
-        torch.save(model.state_dict(), os.path.join(save_dir, "model.pt"))
+        torch.save(model.state_dict(),
+                   os.path.join(save_dir, "model.pt"))
         mode = "whole"
 
-    head_state = model.head_state_dict() if hasattr(model, "head_state_dict") else None
+    head_state = (model.head_state_dict()
+                  if hasattr(model, "head_state_dict") else None)
 
     torch.save({
         "mode": mode,
@@ -701,10 +680,6 @@ def save_trainable(model, optimizer, scheduler, epoch, global_step, save_dir):
 
 
 def load_adapter_into(model, save_dir: str):
-    """
-    Восстанавливает веса энкодера. Определяет режим по наличию файлов.
-    PEFT → adapter/ ; full → encoder.pt ; whole → model.pt.
-    """
     from peft import set_peft_model_state_dict
     from safetensors.torch import load_file
 
@@ -745,5 +720,4 @@ def load_adapter_into(model, save_dir: str):
         print(f"[load_adapter] whole model.pt, {len(state)} keys")
         return
 
-    raise FileNotFoundError(
-        f"нет adapter/, encoder.pt или model.pt в {save_dir}")
+    raise FileNotFoundError(f"нет adapter/, encoder.pt или model.pt в {save_dir}")

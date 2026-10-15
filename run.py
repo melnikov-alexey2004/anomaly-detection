@@ -14,6 +14,7 @@ import datetime as _dt
 import tqdm.auto as tqdm
 import numpy as np
 import torch
+import torch.nn as nn
 from torch.utils.data import DataLoader, Sampler
 
 from huggingface_hub import (
@@ -54,6 +55,10 @@ class Config:
     start_line: int = 0
     end_line: typing.Optional[int] = None
 
+    # кэш
+    use_cache: bool = True
+    cache_dir: str = "/content/cache"
+
     # ---------- доли ----------
     eval_start_ratio: float = 0.9
     train_ratio: float = 0.3
@@ -76,7 +81,7 @@ class Config:
     jasper_batch: int = 64
     cache_max_lines: int = 50_000
 
-    # ---------- Longformer (используется _build_longformer_encoder) ----------
+    # ---------- Longformer ----------
     longformer_model_name: str = "allenai/longformer-base-4096"
     longformer_layers: int = 12
     longformer_attention_window: int = 100
@@ -91,18 +96,14 @@ class Config:
     aggregate_mode: str = "weighted"
     use_learned_cls: bool = True
 
-    # ---------- dtype весов / квантизация / FP8 ----------
-    # "bf16" | "fp16" | "fp32" | "tf32"
-    model_dtype: str = "bf16"
-    # None → обычный float dtype; иначе — BitsAndBytesConfig (QLoRA)
+    # ---------- dtype / квантизация / FP8 ----------
+    model_dtype: str = "bf16"                              # bf16 | fp16 | fp32 | tf32
     quantization_config: typing.Optional[BitsAndBytesConfig] = None
-    # FP8 (Ada/Hopper/Blackwell). Несовместим с quantization_config.
     fp8_training: bool = False
-    fp8_backend: str = "torchao"      # "torchao" | "transformer_engine"
-    fp8_recipe: str = "rowwise"       # "tensorwise" | "rowwise" | "rowwise_with_gw_hp"
+    fp8_backend: str = "torchao"
+    fp8_recipe: str = "rowwise"
 
     # ---------- PEFT ----------
-    # Единственный источник истины: готовый PeftConfig. Без fallback.
     peft_config: typing.Optional[PeftConfig] = None
 
     # ---------- обучение ----------
@@ -121,11 +122,11 @@ class Config:
     max_samples: typing.Optional[int] = None
     min_samples: typing.Optional[int] = None
 
-    # ---------- режим тренировки ----------
+    # ---------- train mode ----------
     train_mode: str = "all"
     mixed_prev_fraction: float = 0.1
 
-    # ---------- сохранение предсказаний ----------
+    # ---------- predictions ----------
     save_predictions: bool = True
     predictions_dir: str = "/content/predictions"
 
@@ -160,7 +161,8 @@ def cfg_to_json_dict(cfg: Config) -> dict:
                 out[k] = {"_type": type(v).__name__,
                           **{kk: str(vv) for kk, vv in v.to_dict().items()}}
         elif k in ("encoder_factory", "model_factory"):
-            out[k] = None if v is None else f"<callable {getattr(v, '__name__', v)}>"
+            out[k] = (None if v is None
+                      else f"<callable {getattr(v, '__name__', v)}>")
         else:
             out[k] = v
     return out
@@ -218,7 +220,6 @@ class LimitedIterable(torch.utils.data.IterableDataset):
 
 
 class RangeSampler(Sampler):
-    """Диапазон [start, end) с шагом step, без oversample."""
     def __init__(self, start: int, end: int, step: int):
         self.indices = list(range(start, end, step))
 
@@ -269,165 +270,7 @@ def download_folder(repo_id, path_in_repo, local_dir):
                       allow_patterns=[f"{path_in_repo}/**"],
                       local_dir=local_dir)
 
-import torch
-from transformers import AutoModel, AutoConfig
 
-def print_model_layers(model_name: str, max_depth: int = 4, max_show: int = 60):
-    print(f"\n{'='*70}\nModel: {model_name}\n{'='*70}")
-
-    cfg = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
-    model = AutoModel.from_pretrained(model_name, config=cfg,
-                                       trust_remote_code=True)
-
-    total = sum(p.numel() for p in model.parameters())
-    print(f"Total parameters: {total:,}")
-    print(f"Hidden size:      {getattr(cfg, 'hidden_size', 'N/A')}")
-    print(f"Num layers:       {getattr(cfg, 'num_hidden_layers', 'N/A')}")
-    print(f"\n{'Layer name':<70} {'Type':<22} {'Shape'}")
-    print("-" * 120)
-
-    layers = []
-    for name, module in model.named_modules():
-        if name.count('.') > max_depth:
-            continue
-        if isinstance(module, (torch.nn.Linear, torch.nn.LayerNorm,
-                                torch.nn.Embedding)):
-            layers.append(name)
-
-    for name in layers[:max_show]:
-        m = dict(model.named_modules())[name]
-        w = getattr(m, 'weight', None)
-        shape = tuple(w.shape) if w is not None else ()
-        print(f"{name:<70} {type(m).__name__:<22} {shape}")
-
-    if len(layers) > max_show:
-        print(f"... и ещё {len(layers) - max_show} слоёв")
-    return model
-# model = print_model_layers("allenai/longformer-base-4096")
-
-from sentence_transformers import SentenceTransformer
-
-def print_jasper_layers(model_name: str, max_show: int = 40):
-    print(f"\n{'='*70}\nJasper: {model_name}\n{'='*70}")
-
-    st = SentenceTransformer(model_name, trust_remote_code=True,
-                              device="cpu")
-
-    # 1. Собрать все параметры верхнего уровня
-    total = sum(p.numel() for p in st.parameters())
-    trainable = sum(p.numel() for p in st.parameters() if p.requires_grad)
-    print(f"Total parameters:     {total:,}")
-    print(f"Trainable parameters: {trainable:,}  (заморожен? {trainable == 0})")
-    print()
-
-    # 2. Основной энкодер внутри SentenceTransformer
-    inner = st[0] if len(st) > 0 else None
-    print(f"First module: {type(inner).__name__}")
-    if hasattr(inner, 'auto_model'):
-        am = inner.auto_model
-        print(f"  auto_model: {type(am).__name__}")
-        print(f"  hidden_size: {am.config.hidden_size}")
-        print(f"  num_layers:  {am.config.num_hidden_layers}")
-
-        # 3. Слои внутренней модели
-        print(f"\n{'Layer name':<70} {'Type':<22} {'Shape'}")
-        print("-" * 120)
-        count = 0
-        for name, module in am.named_modules():
-            if isinstance(module, torch.nn.Linear) and count < max_show:
-                w = getattr(module, 'weight', None)
-                shape = tuple(w.shape) if w is not None else ()
-                print(f"{name:<70} {type(module).__name__:<22} {shape}")
-                count += 1
-
-    return st
-# st = print_jasper_layers("infgrad/Jasper-Token-Compression-600M")
-
-import torch, torch.nn as nn
-
-
-def print_custom_model_layers(model, max_depth: int = 4, max_show: int = 60):
-    print(f"\n{'='*70}\nModel: {type(model).__name__}\n{'='*70}")
-
-    total = sum(p.numel() for p in model.parameters())
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Total parameters:     {total:,}")
-    print(f"Trainable parameters: {trainable:,}  "
-          f"({trainable/total*100:.2f}%)")
-    print(f"\n{'Layer name':<70} {'Type':<22} {'Shape'}")
-    print("-" * 120)
-
-    layers = []
-    for name, module in model.named_modules():
-        if name.count('.') > max_depth:
-            continue
-        if isinstance(module, (torch.nn.Linear, torch.nn.LayerNorm,
-                                torch.nn.Embedding, torch.nn.GRU,
-                                torch.nn.LSTM, torch.nn.MultiheadAttention,
-                                torch.nn.Conv1d, torch.nn.Conv2d)):
-            layers.append(name)
-
-    for name in layers[:max_show]:
-        m = dict(model.named_modules())[name]
-        w = getattr(m, 'weight', None)
-        shape = tuple(w.shape) if w is not None else ()
-        print(f"{name:<70} {type(m).__name__:<22} {shape}")
-
-    if len(layers) > max_show:
-        print(f"... и ещё {len(layers) - max_show} слоёв")
-    return model
-
-def inspect_model(model, max_depth: int = 4, max_show: int = 60):
-    """
-    Универсальный осмотр: Longformer/RoBERTa/кастом/Jasper.
-    """
-    from transformers import PreTrainedModel
-
-    # Jasper-обёртка: разворачиваем
-    try:
-        from sentence_transformers import SentenceTransformer
-        if isinstance(model, SentenceTransformer):
-            print(f"[inspect] SentenceTransformer, разворачиваем в auto_model")
-            for m in model:
-                if hasattr(m, 'auto_model'):
-                    model = m.auto_model
-                    break
-    except Exception:
-        pass
-
-    # Longformer/RoBERTa/любой HF
-    if isinstance(model, PreTrainedModel):
-        print(f"[inspect] HF model: {type(model).__name__}")
-        cfg = model.config
-        print(f"  hidden_size: {getattr(cfg, 'hidden_size', 'N/A')}")
-        print(f"  num_layers:  {getattr(cfg, 'num_hidden_layers', 'N/A')}")
-
-    total = sum(p.numel() for p in model.parameters())
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"  total params:     {total:,}")
-    print(f"  trainable params: {trainable:,} ({trainable/total*100:.2f}%)")
-
-    print(f"\n{'Layer name':<70} {'Type':<22} {'Shape'}")
-    print("-" * 120)
-
-    layers = []
-    for name, module in model.named_modules():
-        if name.count('.') > max_depth:
-            continue
-        if isinstance(module, (torch.nn.Linear, torch.nn.LayerNorm,
-                                torch.nn.Embedding, torch.nn.GRU,
-                                torch.nn.LSTM, torch.nn.MultiheadAttention)):
-            layers.append(name)
-
-    for name in layers[:max_show]:
-        m = dict(model.named_modules())[name]
-        w = getattr(m, 'weight', None)
-        shape = tuple(w.shape) if w is not None else ()
-        print(f"{name:<70} {type(m).__name__:<22} {shape}")
-
-    if len(layers) > max_show:
-        print(f"... и ещё {len(layers) - max_show}")
-    return model
 # ============================================================
 # train_loop
 # ============================================================
@@ -516,7 +359,6 @@ def train_loop(model, optimizer, scheduler, train_loader,
                       f"n={ev['n_windows']}")
                 model.train()
 
-        # eval в конце эпохи
         ev = evaluate(model, val_loader_small, device, criterion,
                       max_windows=cfg.eval_max_windows)
         rec = {
@@ -540,7 +382,6 @@ def train_loop(model, optimizer, scheduler, train_loader,
               f"R={ev['recall']:.3f} n={ev['n_windows']} "
               f"cache: {line_cache.stats()}")
 
-        # чекпоинт
         local_ckpt = f"/content/ckpt_{cfg.run_tag}_e{epoch}"
         save_trainable(model, optimizer, scheduler, epoch + 1,
                        global_step, local_ckpt)
@@ -553,13 +394,11 @@ def train_loop(model, optimizer, scheduler, train_loader,
                         repo_id, f"runs/{cfg.run_tag}/train_state.pt")
         print(f"[save] epoch {epoch} -> {local_ckpt}")
 
-        # предсказания после каждой эпохи
         if cfg.save_predictions:
             _save_predictions(model, ds, train_loader, val_loader_small,
                               cfg, device, line_cache,
                               epoch=epoch, phase="epoch")
 
-    # финальный полный eval
     if cfg.final_full_eval:
         ev = evaluate(model, val_loader_full, device, criterion,
                       max_windows=None, desc="final full eval")
@@ -587,7 +426,7 @@ def train_loop(model, optimizer, scheduler, train_loader,
 
 
 # ============================================================
-# Вспомогательные сборки
+# Вспомогательные
 # ============================================================
 
 _DATASET_CLS = {"bgl": BGL, "tbird": Tbird, "spirit": Spirit,
@@ -636,12 +475,14 @@ def _build_train_loader(ds, eval_start_line, cfg, line_cache,
     safe_max = max(0, min(train_limit, eval_start_line - cfg.win_size))
 
     if base_sampler is None:
-        print("[sampler] строим BalancedSampler (может занять минуты)...")
+        print("[sampler] строим BalancedSampler...")
+        cache_root = cfg.cache_dir if cfg.use_cache else None
         base_sampler = BalancedSampler(
             ds, target_ratio=cfg.target_ratio, seed=cfg.seed,
             min_samples=cfg.min_samples, max_samples=cfg.max_samples,
             max_oversample_factor=cfg.sampler_max_oversample,
-            min_minority_for_balance=cfg.sampler_min_minority)
+            min_minority_for_balance=cfg.sampler_min_minority,
+            cache_dir=cache_root)
         print("[sampler] готов")
     else:
         print("[sampler] переиспользуем существующий BalancedSampler")
@@ -652,8 +493,8 @@ def _build_train_loader(ds, eval_start_line, cfg, line_cache,
         print(f"[loader] РЕЖИМ: только новые данные, "
               f"окна в [{safe_min}, {safe_max})")
 
-    train_sampler = FilteredSampler(
-        base_sampler, max_start=safe_max, min_start=safe_min)
+    train_sampler = FilteredSampler(base_sampler, max_start=safe_max,
+                                     min_start=safe_min)
     collate = make_collate_fn(line_cache)
     train_loader = DataLoader(
         ds, batch_size=cfg.batch_size, sampler=train_sampler,
@@ -687,7 +528,6 @@ def _build_model(cfg, jasper_dim, device):
         model = LogAnomalyModel(cfg, jasper_dim, device)
 
     if cfg.quantization_config is not None:
-        # bnb сам управляет device у base-части; головы переносим вручную
         for name in ("projector", "aggregator", "classifier", "time2vec"):
             m = getattr(model, name, None)
             if isinstance(m, nn.Module):
@@ -696,23 +536,15 @@ def _build_model(cfg, jasper_dim, device):
             model.cls_emb = nn.Parameter(model.cls_emb.data.to(device))
     else:
         model = model.to(device)
-        if cfg.model_dtype != "fp32" and cfg.model_dtype != "tf32":
+        if cfg.model_dtype not in ("fp32", "tf32"):
             model = model.to(resolve_dtype(cfg))
     return model
 
 
 def _save_predictions(model, ds, train_loader, val_loader,
-                      cfg, device, line_cache,
-                      epoch: int, phase: str):
-    """
-    Сохраняет:
-      - eval: полный val_loader (small в конце эпохи, full на final)
-      - train: уникальные окна в [safe_min, safe_max) без oversample
-    Файлы перезаписываются. На диске всегда последнее состояние.
-    """
+                      cfg, device, line_cache, epoch: int, phase: str):
     os.makedirs(cfg.predictions_dir, exist_ok=True)
 
-    # ---------- eval ----------
     print(f"[pred] collecting eval (phase={phase})...")
     ev = collect_predictions(model, val_loader, device, desc="pred eval")
     eval_path = os.path.join(cfg.predictions_dir,
@@ -725,7 +557,6 @@ def _save_predictions(model, ds, train_loader, val_loader,
     print(f"[pred] saved {eval_path} | n={len(ev['labels'])}, "
           f"pos={int(ev['labels'].sum())}")
 
-    # ---------- train (уникальные окна) ----------
     fs = train_loader.sampler
     safe_min = getattr(fs, "min_start", 0)
     safe_max = getattr(fs, "max_start", ds.total_lines)
@@ -777,6 +608,10 @@ def run(cfg: Config):
     run_path_in_repo = f"runs/{cfg.run_tag}"
     print(f"[run] tag={cfg.run_tag}")
 
+    cache_root = cfg.cache_dir if cfg.use_cache else None
+    if cache_root:
+        os.makedirs(cache_root, exist_ok=True)
+
     data_cls = _DATASET_CLS[cfg.dataset]
     max_lines = math.inf if cfg.max_lines is None else cfg.max_lines
     d = data_cls(
@@ -785,7 +620,8 @@ def run(cfg: Config):
         start_line=cfg.start_line, end_line=cfg.end_line,
         use_in_colab=cfg.use_in_colab)
     ds = SuperComputerDataset(d, cfg.anchor_step,
-                              train_ratio=cfg.eval_start_ratio)
+                              train_ratio=cfg.eval_start_ratio,
+                              cache_dir=cache_root)
     print(f"[data] total_lines={ds.total_lines}")
 
     val_ds = EvaluationDataset(ds)
@@ -825,8 +661,7 @@ def run(cfg: Config):
 
         train_state_dir = os.path.join(local_ckpt, resume_path_in_repo)
         print(f"[resume] train_state_dir={train_state_dir}")
-        assert os.path.isdir(train_state_dir), \
-            f"нет папки: {train_state_dir}"
+        assert os.path.isdir(train_state_dir)
 
         load_adapter_into(model, train_state_dir)
         ckpt_state = torch.load(
@@ -908,7 +743,8 @@ def run(cfg: Config):
             pass
 
         def _key(r):
-            return (r.get("run_tag"), r.get("global_step"), r.get("phase"))
+            return (r.get("run_tag"), r.get("global_step"),
+                    r.get("phase"))
 
         seen = {_key(r) for r in merged_data}
         new_records = [r for r in history if _key(r) not in seen]
@@ -941,8 +777,7 @@ def run(cfg: Config):
 
 def continue_training(state: dict, cfg: Config) -> dict:
     if cfg.warmup_steps > 0:
-        print(f"[continue] warn: warmup_steps={cfg.warmup_steps} > 0. "
-              f"Для дообучения рекомендуется warmup_steps=0.")
+        print(f"[continue] warn: warmup_steps={cfg.warmup_steps} > 0.")
 
     model = state["model"]
     optimizer = state["optimizer"]
@@ -1040,7 +875,8 @@ def continue_training(state: dict, cfg: Config) -> dict:
             pass
 
         def _key(r):
-            return (r.get("run_tag"), r.get("global_step"), r.get("phase"))
+            return (r.get("run_tag"), r.get("global_step"),
+                    r.get("phase"))
 
         seen = {_key(r) for r in merged_data}
         new_records = [r for r in history if _key(r) not in seen]

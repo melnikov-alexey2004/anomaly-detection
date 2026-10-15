@@ -8,25 +8,78 @@ import gzip
 import typing
 import datetime
 import math
+import hashlib
+import pickle
+import tempfile
 
+
+# ============================================================
+# Хелперы для кэша
+# ============================================================
+
+def _stable_hash(obj) -> str:
+    import json
+    s = json.dumps(obj, sort_keys=True, default=str)
+    return hashlib.blake2b(s.encode("utf-8"), digest_size=16).hexdigest()
+
+
+def _file_fingerprint(path: str) -> dict:
+    try:
+        st = os.stat(path)
+        return {"size": st.st_size, "mtime": int(st.st_mtime)}
+    except OSError:
+        return {"size": 0, "mtime": 0}
+
+
+def _atomic_save(obj, path: str):
+    d = os.path.dirname(path)
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".tmp_", suffix=".pt")
+    os.close(fd)
+    try:
+        with open(tmp, "wb") as f:
+            pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _safe_load(path: str):
+    try:
+        with open(path, "rb") as f:
+            return pickle.load(f)
+    except Exception as e:
+        print(f"[cache] load failed {path}: {e}")
+        return None
+
+
+# ============================================================
+# Data (базовый класс с загрузкой/распаковкой)
+# ============================================================
 
 class Data:
     path_to_log_dir: str
     path_to_log: str
     cnt_ind: int
 
-    def __init__(self, downloaded_url: str, cache_dir: str = os.path.expanduser('~/.dataset'),
-                 dataset_dir: str = 'hdfs', extract_dir: str = 'archive_extracted',
+    def __init__(self, downloaded_url: str,
+                 cache_dir: str = os.path.expanduser('~/.dataset'),
+                 dataset_dir: str = 'hdfs',
+                 extract_dir: str = 'archive_extracted',
                  repeat_download: bool = False,
-                 custom_archive_path: typing.Optional[str] = None, remove_archive: bool = False,
-                 archive_type=None, use_in_colab: bool = False, encoding: str = "latin-1",
-                 errors: str = "replace",
+                 custom_archive_path: typing.Optional[str] = None,
+                 remove_archive: bool = False,
+                 archive_type=None, use_in_colab: bool = False,
+                 encoding: str = "latin-1", errors: str = "replace",
                  max_lines: float = math.inf,
                  start_line: int = 0,
                  end_line: typing.Optional[int] = None,
                  window_size: int = 200,
-                 step_size: int = 200,
-                 ):
+                 step_size: int = 200):
         assert window_size > 1
         assert step_size >= 1
         assert max_lines >= 0
@@ -82,7 +135,8 @@ class Data:
             archive_path = filepath
 
             get_mime_type = lambda fp, p: \
-            subprocess.run(['file', f'-{p}', fp], capture_output=True, text=True).stdout.split()[
+            subprocess.run(['file', f'-{p}', fp],
+                           capture_output=True, text=True).stdout.split()[
                 1].removesuffix(';').split('/')
 
             if archive_type is None:
@@ -106,8 +160,9 @@ class Data:
             else:
                 exact_tp = archive_type
                 assert exact_tp in ["zip", "tar", "gztar", "GZIP"]
+                print("тип архива статично указан (archive_type)")
 
-            assert exact_tp is not None
+            assert exact_tp is not None, f"{pref=} {tp=}"
 
             extract_dir = os.path.join(extract_dir, dataset_dir)
             os.makedirs(extract_dir, exist_ok=True)
@@ -116,8 +171,10 @@ class Data:
                 with gzip.open(filepath, 'rb') as f_in:
                     with open(extract_dir + f"/{dataset_dir}.log", 'wb') as f_out:
                         shutil.copyfileobj(f_in, f_out)
+                self.archive_type_is_gz = True
             else:
-                shutil.unpack_archive(filepath, extract_dir=extract_dir, format=exact_tp)
+                shutil.unpack_archive(filepath, extract_dir=extract_dir,
+                                      format=exact_tp)
 
             print('extracted in', extract_dir)
             if remove_archive:
@@ -139,6 +196,10 @@ class Data:
             return None, "", 0
         return dt, cnt, label
 
+
+# ============================================================
+# Нормализация
+# ============================================================
 
 import numpy as np
 import math
@@ -177,8 +238,13 @@ def normalize_text(s: str) -> str:
 import io
 
 
+# ============================================================
+# SuperComputerDataset
+# ============================================================
+
 class SuperComputerDataset(Dataset):
-    def __init__(self, source: Data, n: int, train_ratio: float = 0.3):
+    def __init__(self, source: Data, n: int, train_ratio: float = 0.3,
+                 cache_dir: typing.Optional[str] = None):
         assert n > 1
         assert 0.0 < train_ratio <= 1.0
 
@@ -194,15 +260,58 @@ class SuperComputerDataset(Dataset):
         self.window_size = source.window_size
         self.step_size = source.step_size
         self.train_ratio = train_ratio
+        self.cache_dir = cache_dir
 
         self.line_positions: list[int] = []
         self.labels_list: list[int] = []
         self.total_lines = 0
         self._num_samples: int = 0
 
-        self._build_index()
+        fp_payload = {
+            "filepath":   self.filepath,
+            "file":       _file_fingerprint(self.filepath),
+            "n":          n,
+            "win_size":   self.window_size,
+            "step_size":  self.step_size,
+            "start_line": self.start_line,
+            "end_line":   self.end_line,
+            "max_lines":  str(self.max_lines),
+            "train_ratio": self.train_ratio,
+        }
+        self._cache_fp = _stable_hash(fp_payload)
+        cache_path = self._cache_path()
+
+        loaded = False
+        if cache_path:
+            data = _safe_load(cache_path)
+            if data is not None and data.get("fingerprint") == self._cache_fp:
+                self.line_positions = data["line_positions"]
+                self.labels_list    = data["labels_list"]
+                self.total_lines    = data["total_lines"]
+                self._num_samples   = data["_num_samples"]
+                print(f"[data] cache HIT: {cache_path}")
+                loaded = True
+
+        if not loaded:
+            print(f"[data] building index...")
+            self._build_index()
+            if cache_path:
+                _atomic_save({
+                    "fingerprint":    self._cache_fp,
+                    "line_positions": self.line_positions,
+                    "labels_list":    self.labels_list,
+                    "total_lines":    self.total_lines,
+                    "_num_samples":   self._num_samples,
+                }, cache_path)
+                print(f"[data] cache SAVED: {cache_path}")
+
         self.labels = np.asarray(self.labels_list, dtype=np.int8)
         self.file: typing.Optional[io.BufferedReader] = None
+
+    def _cache_path(self) -> typing.Optional[str]:
+        if not self.cache_dir:
+            return None
+        return os.path.join(self.cache_dir, f"dataset_{self._cache_fp}.pkl")
 
     def _build_index(self) -> None:
         max_read = None if math.isinf(self.max_lines) else int(self.max_lines)
@@ -229,7 +338,8 @@ class SuperComputerDataset(Dataset):
                     self.line_positions.append(pos)
 
                 line = raw.decode("latin-1", errors="replace")
-                self.labels_list.append(self.source.get_time_content_label(line)[2])
+                self.labels_list.append(
+                    self.source.get_time_content_label(line)[2])
                 line_idx += 1
 
         self.total_lines = line_idx
@@ -241,7 +351,8 @@ class SuperComputerDataset(Dataset):
         if self.total_lines < self.window_size:
             total_samples = 0
         else:
-            total_samples = (self.total_lines - self.window_size) // self.step_size + 1
+            total_samples = (self.total_lines - self.window_size) \
+                // self.step_size + 1
 
         self._num_samples = int(total_samples * self.train_ratio)
 
@@ -284,6 +395,10 @@ class SuperComputerDataset(Dataset):
         return max(0, self.total_lines - self.window_size + 1)
 
 
+# ============================================================
+# EvaluationDataset
+# ============================================================
+
 class EvaluationDataset(IterableDataset):
     def __init__(self, train_dataset: SuperComputerDataset):
         self.train_dataset = train_dataset
@@ -314,6 +429,10 @@ class EvaluationDataset(IterableDataset):
             yield self.train_dataset[start]
 
 
+# ============================================================
+# Конкретные датасеты
+# ============================================================
+
 class BGL(Data):
     def __init__(self, window_size: int, step_size: int,
                  max_lines: float = math.inf,
@@ -326,11 +445,11 @@ class BGL(Data):
                          window_size=window_size, step_size=step_size,
                          max_lines=max_lines, start_line=start_line,
                          end_line=end_line)
-
         log_format = ('<Label> <Id> <Date> <Code1> <Time> <Code2> '
                       '<Component1> <Component2> <Level> <Content>').split()
         self.cnt_ind = log_format.index("<Content>")
-        self.path_to_log_dir = os.path.join(self.extract_dir, self.dataset_dir)
+        self.path_to_log_dir = os.path.join(self.extract_dir,
+                                            self.dataset_dir)
         self.path_to_log = os.path.join(self.path_to_log_dir,
                                         self.dataset_dir + ".log")
 
@@ -362,11 +481,11 @@ class Tbird(Data):
                          window_size=window_size, step_size=step_size,
                          max_lines=max_lines, start_line=start_line,
                          end_line=end_line)
-
         log_format = ('<Label> <Id> <Date> <Admin> <Month> <Day> <Time> '
                       '<AdminAddr> <Content>').split()
         self.cnt_ind = log_format.index("<Content>")
-        self.path_to_log_dir = os.path.join(self.extract_dir, self.dataset_dir)
+        self.path_to_log_dir = os.path.join(self.extract_dir,
+                                            self.dataset_dir)
         self.path_to_log = os.path.join(self.path_to_log_dir,
                                         self.dataset_dir + ".log")
 
@@ -400,11 +519,11 @@ class Spirit(Data):
                          window_size=window_size, step_size=step_size,
                          max_lines=max_lines, start_line=start_line,
                          end_line=end_line)
-
         log_format = ('<Label> <Id> <Date> <Admin> <Month> <Day> <Time> '
                       '<AdminAddr> <Content>').split()
         self.cnt_ind = log_format.index("<Content>")
-        self.path_to_log_dir = os.path.join(self.extract_dir, self.dataset_dir)
+        self.path_to_log_dir = os.path.join(self.extract_dir,
+                                            self.dataset_dir)
         self.path_to_log = os.path.join(self.path_to_log_dir,
                                         self.dataset_dir + ".log")
 
@@ -439,11 +558,11 @@ class Liberty(Data):
                          window_size=window_size, step_size=step_size,
                          max_lines=max_lines, start_line=start_line,
                          end_line=end_line)
-
         log_format = ('<Label> <Id> <Date> <Admin> <Month> <Day> <Time> '
                       '<AdminAddr> <Content>').split()
         self.cnt_ind = log_format.index("<Content>")
-        self.path_to_log_dir = os.path.join(self.extract_dir, self.dataset_dir)
+        self.path_to_log_dir = os.path.join(self.extract_dir,
+                                            self.dataset_dir)
         self.path_to_log = os.path.join(self.path_to_log_dir,
                                         self.dataset_dir + ".log")
 
@@ -465,6 +584,10 @@ class Liberty(Data):
         return dt, cnt, label
 
 
+# ============================================================
+# BalancedSampler с кэшем
+# ============================================================
+
 class BalancedSampler(Sampler):
     """
     Балансирует классы oversample'ом minority.
@@ -473,103 +596,172 @@ class BalancedSampler(Sampler):
         каждый minority-пример за эпоху. Защита от заучивания.
     min_minority_for_balance: если minority меньше — балансировка
         отключается, сэмплер работает как uniform.
+    cache_dir: если задан, кэширует индексы на диск (fingerprint по
+        dataset + гиперпараметрам).
     """
     def __init__(self, dataset, target_ratio=0.3, max_samples=None,
                  min_samples=1000, seed=None,
                  max_oversample_factor: float = 10.0,
-                 min_minority_for_balance: int = 50):
+                 min_minority_for_balance: int = 50,
+                 cache_dir: typing.Optional[str] = None):
         self.dataset = dataset
         self.target_ratio = target_ratio
         self.max_samples = max_samples
         self.min_samples = min_samples
         self.max_oversample_factor = max_oversample_factor
         self.min_minority_for_balance = min_minority_for_balance
+        self.cache_dir = cache_dir
 
         self.W = dataset.window_size
         self.N = dataset.total_lines
         self.step_size = dataset.step_size
-        labels = self.dataset.labels
 
-        all_starts = np.arange(0, self.N - self.W + 1,
-                               self.step_size, dtype=np.int64)
-        prefix = np.zeros(self.N + 1, dtype=np.int64)
-        prefix[1:] = np.cumsum(labels)
-        has_anom = (prefix[all_starts + self.W] - prefix[all_starts]) > 0
-        self.normal_indices = all_starts[~has_anom]
-        self.anomalous_indices = all_starts[has_anom]
+        fp_payload = {
+            "dataset_fp":  getattr(dataset, "_cache_fp", None),
+            "N":           int(self.N),
+            "W":           int(self.W),
+            "step_size":   int(self.step_size),
+            "target_ratio": float(target_ratio),
+            "max_samples": str(max_samples),
+            "min_samples": str(min_samples),
+            "seed":        str(seed),
+            "max_oversample_factor": float(max_oversample_factor),
+            "min_minority_for_balance": int(min_minority_for_balance),
+        }
+        self._cache_fp = _stable_hash(fp_payload)
+        cache_path = self._cache_path()
 
-        if len(self.anomalous_indices) <= len(self.normal_indices):
-            self.minority_label, self.majority_label = "abnormal", "normal"
-            self.minority_indices = self.anomalous_indices
-            self.majority_indices = self.normal_indices
-        else:
-            self.minority_label, self.majority_label = "normal", "abnormal"
-            self.minority_indices = self.normal_indices
-            self.majority_indices = self.anomalous_indices
+        loaded = False
+        if cache_path:
+            data = _safe_load(cache_path)
+            if data is not None and data.get("fingerprint") == self._cache_fp:
+                self.normal_indices    = data["normal_indices"]
+                self.anomalous_indices = data["anomalous_indices"]
+                self.minority_label    = data["minority_label"]
+                self.majority_label    = data["majority_label"]
+                self.minority_indices  = data["minority_indices"]
+                self.majority_indices  = data["majority_indices"]
+                self.minority_count    = data["minority_count"]
+                self.total_size        = data["total_size"]
+                self.balance_enabled   = data["balance_enabled"]
+                print(f"[sampler] cache HIT: {cache_path}")
+                print(f"[sampler] итог (cached): minority={self.minority_count}, "
+                      f"majority={self.total_size - self.minority_count}, "
+                      f"total={self.total_size}, "
+                      f"balance={'ON' if self.balance_enabled else 'OFF'}")
+                loaded = True
 
-        n_min = len(self.minority_indices)
-        n_maj = len(self.majority_indices)
+        if not loaded:
+            labels = self.dataset.labels
+            all_starts = np.arange(0, self.N - self.W + 1,
+                                   self.step_size, dtype=np.int64)
+            prefix = np.zeros(self.N + 1, dtype=np.int64)
+            prefix[1:] = np.cumsum(labels)
+            has_anom = (prefix[all_starts + self.W]
+                        - prefix[all_starts]) > 0
+            self.normal_indices    = all_starts[~has_anom]
+            self.anomalous_indices = all_starts[has_anom]
 
-        print(f'sampler: GLOBAL a={len(self.anomalous_indices)}, '
-              f'n={len(self.normal_indices)}')
-        t = n_min + n_maj
-        if t > 0:
-            print(f'sampler: frac_a={len(self.anomalous_indices)/t*100:.2f}%, '
-                  f'frac_n={len(self.normal_indices)/t*100:.2f}%')
+            if len(self.anomalous_indices) <= len(self.normal_indices):
+                self.minority_label, self.majority_label = "abnormal", "normal"
+                self.minority_indices = self.anomalous_indices
+                self.majority_indices = self.normal_indices
+            else:
+                self.minority_label, self.majority_label = "normal", "abnormal"
+                self.minority_indices = self.normal_indices
+                self.majority_indices = self.anomalous_indices
 
-        self.balance_enabled = True
-        if n_min == 0:
-            print(f"[sampler] WARNING: minority ({self.minority_label}) = 0")
-            self.balance_enabled = False
-            self.minority_count = 0
-            self.total_size = n_maj
-        elif n_min < self.min_minority_for_balance:
-            print(f"[sampler] WARNING: minority={n_min} < "
-                  f"{self.min_minority_for_balance}. Балансировка отключена.")
-            self.balance_enabled = False
-            self.minority_count = n_min
-            self.total_size = n_min + n_maj
-        else:
-            target_minority = int((self.target_ratio * n_maj)
-                                  / (1 - self.target_ratio))
-            oversample_cap = int(n_min * self.max_oversample_factor)
-            self.minority_count = max(n_min,
-                                      min(target_minority, oversample_cap))
-            self.total_size = self.minority_count + n_maj
-            if self.minority_count < target_minority:
-                actual = self.minority_count / self.total_size
-                print(f"[sampler] minority capped: {self.minority_count} "
-                      f"(target был {target_minority}, "
-                      f"cap factor={self.max_oversample_factor}). "
-                      f"Фактический target_ratio={actual:.3f}")
+            n_min = len(self.minority_indices)
+            n_maj = len(self.majority_indices)
 
-        if self.balance_enabled:
-            if max_samples is not None:
-                if max_samples > self.total_size:
-                    warnings.warn(f"max_samples > total")
-                else:
-                    print(f"total урезали до: {max_samples}")
-                    self.total_size = max_samples
-                    self.minority_count = int(self.total_size * self.target_ratio)
-            elif min_samples and self.total_size < min_samples:
-                print(f"min_samples: увеличено до {min_samples}")
-                self.total_size = min_samples
-                self.minority_count = int(self.total_size * self.target_ratio)
+            print(f'sampler: GLOBAL a={len(self.anomalous_indices)}, '
+                  f'n={len(self.normal_indices)}')
+            t = n_min + n_maj
+            if t > 0:
+                print(f'sampler: frac_a='
+                      f'{len(self.anomalous_indices)/t*100:.2f}%, '
+                      f'frac_n={len(self.normal_indices)/t*100:.2f}%')
 
-        if n_min == 0:
-            warnings.warn(f"нет окон с меткой {self.minority_label}")
-        if n_maj == 0:
-            warnings.warn("нет окон с меткой мажоритарного класса")
+            self.balance_enabled = True
+            if n_min == 0:
+                print(f"[sampler] WARNING: minority "
+                      f"({self.minority_label}) = 0")
+                self.balance_enabled = False
+                self.minority_count = 0
+                self.total_size = n_maj
+            elif n_min < self.min_minority_for_balance:
+                print(f"[sampler] WARNING: minority={n_min} < "
+                      f"{self.min_minority_for_balance}. "
+                      f"Балансировка отключена.")
+                self.balance_enabled = False
+                self.minority_count = n_min
+                self.total_size = n_min + n_maj
+            else:
+                target_minority = int((self.target_ratio * n_maj)
+                                      / (1 - self.target_ratio))
+                oversample_cap = int(n_min * self.max_oversample_factor)
+                self.minority_count = max(n_min,
+                                          min(target_minority, oversample_cap))
+                self.total_size = self.minority_count + n_maj
+                if self.minority_count < target_minority:
+                    actual = self.minority_count / self.total_size
+                    print(f"[sampler] minority capped: {self.minority_count} "
+                          f"(target был {target_minority}, "
+                          f"cap factor={self.max_oversample_factor}). "
+                          f"Фактический target_ratio={actual:.3f}")
 
-        print(f"[sampler] итог: minority={self.minority_count}, "
-              f"majority={self.total_size - self.minority_count}, "
-              f"total={self.total_size}, "
-              f"balance={'ON' if self.balance_enabled else 'OFF'}, "
-              f"frac_minority="
-              f"{self.minority_count / max(self.total_size, 1) * 100:.1f}%")
+            if self.balance_enabled:
+                if max_samples is not None:
+                    if max_samples > self.total_size:
+                        warnings.warn("max_samples > total")
+                    else:
+                        print(f"total урезали до: {max_samples}")
+                        self.total_size = max_samples
+                        self.minority_count = int(self.total_size
+                                                  * self.target_ratio)
+                elif min_samples and self.total_size < min_samples:
+                    print(f"min_samples: увеличено до {min_samples}")
+                    self.total_size = min_samples
+                    self.minority_count = int(self.total_size
+                                              * self.target_ratio)
+
+            if n_min == 0:
+                warnings.warn(f"нет окон с меткой {self.minority_label}")
+            if n_maj == 0:
+                warnings.warn("нет окон с меткой мажоритарного класса")
+
+            print(f"[sampler] итог: minority={self.minority_count}, "
+                  f"majority={self.total_size - self.minority_count}, "
+                  f"total={self.total_size}, "
+                  f"balance={'ON' if self.balance_enabled else 'OFF'}, "
+                  f"frac_minority="
+                  f"{self.minority_count / max(self.total_size, 1) * 100:.1f}%")
+
+            if cache_path:
+                try:
+                    _atomic_save({
+                        "fingerprint":       self._cache_fp,
+                        "normal_indices":    self.normal_indices,
+                        "anomalous_indices": self.anomalous_indices,
+                        "minority_label":    self.minority_label,
+                        "majority_label":    self.majority_label,
+                        "minority_indices":  self.minority_indices,
+                        "majority_indices":  self.majority_indices,
+                        "minority_count":    self.minority_count,
+                        "total_size":        self.total_size,
+                        "balance_enabled":   self.balance_enabled,
+                    }, cache_path)
+                    print(f"[sampler] cache SAVED: {cache_path}")
+                except Exception as e:
+                    print(f"[sampler] cache save failed: {e}")
 
         self.seed = seed
         self.rng = None
+
+    def _cache_path(self) -> typing.Optional[str]:
+        if not self.cache_dir:
+            return None
+        return os.path.join(self.cache_dir, f"sampler_{self._cache_fp}.pkl")
 
     def sample_count(self, array: np.ndarray, count: int) -> np.ndarray:
         if count < len(array):
@@ -590,13 +782,16 @@ class BalancedSampler(Sampler):
     def __iter__(self):
         wi = torch.utils.data.get_worker_info()
         base = self.seed if self.seed is not None else 0
-        self.rng = np.random.default_rng(base + (wi.id if wi is not None else 0))
+        self.rng = np.random.default_rng(
+            base + (wi.id if wi is not None else 0))
 
         oversampled_minority = self.sample_count(self.minority_indices,
-                                                 self.minority_count)
-        oversampled_majority = self.sample_count(self.majority_indices,
-                                                 self.total_size - self.minority_count)
-        combined = np.concatenate([oversampled_minority, oversampled_majority])
+                                                  self.minority_count)
+        oversampled_majority = self.sample_count(
+            self.majority_indices,
+            self.total_size - self.minority_count)
+        combined = np.concatenate([oversampled_minority,
+                                    oversampled_majority])
         self.rng.shuffle(combined)
 
         print(f'sampler: GLOBAL num {self.majority_label}='
