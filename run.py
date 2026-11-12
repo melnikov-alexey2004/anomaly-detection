@@ -139,6 +139,13 @@ class Config:
     # ---- eval ----
     eval_max_windows: typing.Optional[int] = 2000
 
+    # ---- eval control ----
+    # {1}    — только stage1 пропускается (baseline head на stage2 сохраняется)
+    # {1,2}  — stage1+stage2 (быстрее, но теряете baseline head)
+    # set()  — eval на всех стадиях (для абляций)
+    skip_eval_stages: typing.Set[int] = dataclasses.field(
+        default_factory=lambda: {1})
+
     # ---- sampler ----
     sampler_max_oversample: float = 10.0
     sampler_min_minority: int = 50
@@ -357,7 +364,8 @@ def _load_llama_template(model, repo_id: str):
 # ============================================================
 
 def _build_loaders(cfg: Config, ds, val_ds, collator, stage_idx: int,
-                    template_only: bool = False):
+                    template_only: bool = False,
+                    need_val: bool = True):
     ratio = cfg.train_ratio
     if cfg.stage_train_ratios and stage_idx in cfg.stage_train_ratios:
         ratio = cfg.stage_train_ratios[stage_idx]
@@ -389,16 +397,22 @@ def _build_loaders(cfg: Config, ds, val_ds, collator, stage_idx: int,
 
     print(f"[loaders] stage{stage_idx} ratio={ratio} "
           f"safe=[{safe_min},{safe_max}) sampler_len={len(sampler)}"
-          f"{' (template)' if template_only else ''}")
+          f"{' (template)' if template_only else ''}"
+          f"{' (no val)' if not need_val else ''}")
 
     train_loader = DataLoader(
         ds, batch_size=cfg.batch_size, sampler=sampler,
         collate_fn=collator, num_workers=cfg.num_workers,
         drop_last=True, persistent_workers=cfg.num_workers > 0)
-    val_loader = DataLoader(
-        LimitedIterable(val_ds, cfg.eval_max_windows),
-        batch_size=cfg.batch_size, shuffle=False,
-        collate_fn=collator, num_workers=cfg.num_workers)
+
+    if need_val:
+        val_loader = DataLoader(
+            LimitedIterable(val_ds, cfg.eval_max_windows),
+            batch_size=cfg.batch_size, shuffle=False,
+            collate_fn=collator, num_workers=cfg.num_workers)
+    else:
+        val_loader = None
+
     return train_loader, val_loader
 
 
@@ -482,7 +496,7 @@ def evaluate(model, loader, device, max_windows=None, desc="eval"):
     from sklearn.metrics import precision_recall_fscore_support
     model.eval()
     probs, ys, n_seen = [], [], 0
-    pbar = tqdm.tqdm(loader, desc=desc, leave=False)   # ← добавить
+    pbar = tqdm.tqdm(loader, desc=desc, leave=False)
     for batch in pbar:
         if batch is None:
             continue
@@ -523,7 +537,7 @@ def train_one_stage(model, train_loader, val_loader, cfg, device,
     optimizer = torch.optim.AdamW(trainable, lr=lr,
                                    weight_decay=cfg.weight_decay)
     accum = max(1, cfg.grad_accum_steps)
-    steps_per_epoch = max(1, len(train_loader) // accum)
+    steps_per_epoch = max(1, math.ceil(len(train_loader) / accum))   # fix 1
     total_steps = steps_per_epoch * n_epochs
     scheduler = _build_scheduler(optimizer, total_steps, cfg, max_lr=lr)
 
@@ -542,6 +556,8 @@ def train_one_stage(model, train_loader, val_loader, cfg, device,
 
     criterion = nn.BCEWithLogitsLoss()
     global_step = start_step
+    stage_num = _STAGE_ORDER.index(stage_name) + 1
+    do_eval = (stage_num not in cfg.skip_eval_stages) and (val_loader is not None)
 
     for epoch_offset in range(n_epochs):
         epoch = start_epoch + epoch_offset
@@ -572,12 +588,18 @@ def train_one_stage(model, train_loader, val_loader, cfg, device,
             pbar.set_postfix({"loss": f"{running / n_b:.4f}",
                               "lr": f"{scheduler.get_last_lr()[0]:.2e}"})
 
-        m = evaluate(model, val_loader, device,
-                     max_windows=cfg.eval_max_windows)
-        print(f"[{stage_name} e{epoch}] loss={running/max(n_b,1):.4f} "
-              f"F1={m['f1']:.4f} P={m['precision']:.4f} "
-              f"R={m['recall']:.4f} n={m['n']} "
-              f"elapsed={time.time()-t0:.0f}s")
+        # ---- eval (skippable per stage) ----
+        if not do_eval:
+            print(f"[{stage_name} e{epoch}] loss={running / max(n_b, 1):.4f} "
+                  f"(eval skipped) elapsed={time.time() - t0:.0f}s")
+        else:
+            m = evaluate(model, val_loader, device,
+                         max_windows=cfg.eval_max_windows,
+                         desc=f"{stage_name} e{epoch} eval")
+            print(f"[{stage_name} e{epoch}] loss={running / max(n_b, 1):.4f} "
+                  f"F1={m['f1']:.4f} P={m['precision']:.4f} "
+                  f"R={m['recall']:.4f} n={m['n']} "
+                  f"elapsed={time.time() - t0:.0f}s")
 
     stage_dir = os.path.join(save_dir, stage_name)
     model.save(stage_dir)
@@ -639,11 +661,14 @@ def run(cfg: Config):
     else:
         print(f"[template] NOT FOUND → will train stage1 and push")
 
+    # ---- stage1 (only if template missing) ----
     if not has_template:
         print(f"\n{'*' * 20} stage1 (llama) {'*' * 20}")
         model.set_train_mode("llama")
+        need_val = 1 not in cfg.skip_eval_stages
         tr, va = _build_loaders(cfg, ds, val_ds, collator,
-                                stage_idx=1, template_only=True)
+                                stage_idx=1, template_only=True,
+                                need_val=need_val)
         train_one_stage(model, tr, va, cfg, device,
                         n_epochs=cfg.n_epochs_stage1, lr=cfg.lr_stage1,
                         stage_name="stage1", save_dir=save_dir)
@@ -652,10 +677,13 @@ def run(cfg: Config):
         except Exception as e:
             print(f"[template] push failed: {e}")
 
+    # ---- stages 2-4 ----
     for idx, name in zip([2, 3, 4], ["stage2", "stage3", "stage4"]):
         print(f"\n{'*' * 20} {name} ({_STAGE_MODE[name]}) {'*' * 20}")
         model.set_train_mode(_STAGE_MODE[name])
-        tr, va = _build_loaders(cfg, ds, val_ds, collator, stage_idx=idx)
+        need_val = idx not in cfg.skip_eval_stages
+        tr, va = _build_loaders(cfg, ds, val_ds, collator, stage_idx=idx,
+                                need_val=need_val)
         train_one_stage(model, tr, va, cfg, device,
                         n_epochs=getattr(cfg, f"n_epochs_{name}"),
                         lr=getattr(cfg, f"lr_{name}"),
@@ -752,8 +780,10 @@ def continue_learning(cfg: Config):
     collator = LogLLMCollator(model.encoder_tokenizer, cfg.max_content_len)
 
     model.set_train_mode(_STAGE_MODE[target])
+    need_val = stage_idx not in cfg.skip_eval_stages
     tr, va = _build_loaders(cfg, ds, val_ds, collator, stage_idx=stage_idx,
-                            template_only=(target == "stage1"))
+                            template_only=(target == "stage1"),
+                            need_val=need_val)
 
     if cfg.run_tag is None:
         cfg.run_tag = f"continue_{target}_{_dt.datetime.now():%Y%m%d_%H%M%S}"
