@@ -144,7 +144,7 @@ class TimeFeatureEncoder(nn.Module):
         L_max = max(Ls) if Ls else 1
         params = list(self.parameters())
         device = params[0].device if params else torch.device("cpu")
-        feats = torch.zeros(B, L_max, self._in_dim(), device=device)
+        feats = torch.zeros(B, L_max, self._in_dim(), device=device)   # fp32
         for b, t_list in enumerate(times_list):
             L = len(t_list); parts = []
             if self.use_delta:
@@ -155,7 +155,7 @@ class TimeFeatureEncoder(nn.Module):
                 feats[b, :L] = torch.cat(parts, dim=-1)
         if self.proj is not None:
             feats = self.proj(feats)
-        return feats.to(self.out_dtype)
+        return feats
 
 
 class CrossAttentionFusion(nn.Module):
@@ -350,20 +350,26 @@ class LogLLM(nn.Module):
         Ls = [e.shape[0] for e in window_embs]
         L_max = max(Ls) if Ls else 1
         D = window_embs[0].shape[1]
-        padded = torch.zeros(B, L_max, D, dtype=self.compute_dtype, device=self.device)
+
+        padded = torch.zeros(B, L_max, D, dtype=self.compute_dtype,
+                             device=self.device)
         mask = torch.zeros(B, L_max, dtype=torch.long, device=self.device)
         for b, e in enumerate(window_embs):
             n = e.shape[0]
             padded[b, :n] = e
             mask[b, :n] = 1
 
-        time_emb = self.time_encoder(times_list).to(self.compute_dtype)
+        time_emb = self.time_encoder(times_list)  # fp32
+        padded_fp32 = padded.float()  # ← каст для fusion
+
         if self.fusion_type == "cross_attention":
-            fused = self.cross_attn(time_emb, padded, log_mask=mask)
+            fused = self.cross_attn(time_emb, padded_fp32, log_mask=mask)
         elif self.fusion_type == "concat":
-            fused = self.concat_proj(torch.cat([padded, time_emb], dim=-1))
+            fused = self.concat_proj(torch.cat([padded_fp32, time_emb], dim=-1))
         else:
-            fused = padded
+            fused = padded_fp32
+
+        fused = fused.to(self.compute_dtype)  # ← обратно в bf16
         return [fused[b, :Ls[b]] for b in range(B)]
 
     # ---------- Forward ----------
@@ -386,10 +392,12 @@ class LogLLM(nn.Module):
         embed = self.llama.get_input_embeddings()
         ins1 = embed(self.llama_tokenizer(
             self.ins1_str, return_tensors="pt",
-            add_special_tokens=False)["input_ids"][0].to(self.device))
+            add_special_tokens=False)["input_ids"][0].to(self.device)
+                     ).to(self.compute_dtype)
         ins2 = embed(self.llama_tokenizer(
             self.ins2_str, return_tensors="pt",
-            add_special_tokens=False)["input_ids"][0].to(self.device))
+            add_special_tokens=False)["input_ids"][0].to(self.device)
+                     ).to(self.compute_dtype)
 
         seqs = [torch.cat([ins1, e, ins2], dim=0) for e in window_embs]
         max_len = max(s.shape[0] for s in seqs)
