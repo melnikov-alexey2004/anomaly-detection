@@ -50,7 +50,7 @@ class Config:
     win_size: int = 199
     step_size: int = 199
     anchor_step: int = 10
-        batch_size: int = 16
+    batch_size: int = 16
     num_workers: int = 4
     use_in_colab: bool = True
     max_lines: typing.Optional[int] = None
