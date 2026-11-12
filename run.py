@@ -478,17 +478,19 @@ def test_dataloader(cfg: Config, n_windows: int = 3):
 # ============================================================
 
 @torch.no_grad()
-def evaluate(model, loader, device, max_windows=None):
+def evaluate(model, loader, device, max_windows=None, desc="eval"):
     from sklearn.metrics import precision_recall_fscore_support
     model.eval()
     probs, ys, n_seen = [], [], 0
-    for batch in loader:
+    pbar = tqdm.tqdm(loader, desc=desc, leave=False)   # ← добавить
+    for batch in pbar:
         if batch is None:
             continue
         logits = model(batch)
         probs.append(torch.sigmoid(logits.float()).cpu())
         ys.append(batch["labels"].cpu())
         n_seen += ys[-1].numel()
+        pbar.set_postfix({"n": n_seen})
         if max_windows is not None and n_seen >= max_windows:
             break
     if not probs:
