@@ -1,3 +1,5 @@
+# dataset module
+
 import torch
 from torch.utils.data import Dataset, DataLoader, Sampler, IterableDataset
 import os
@@ -244,7 +246,10 @@ import io
 
 class SuperComputerDataset(Dataset):
     def __init__(self, source: Data, n: int, train_ratio: float = 0.3,
-                 cache_dir: typing.Optional[str] = None):
+                 cache_dir: typing.Optional[str] = None,
+                 preprocess_fn: typing.Optional[typing.Callable[[str], str]] = None):
+
+        self.preprocess_fn = preprocess_fn or normalize_text
         assert n > 1
         assert 0.0 < train_ratio <= 1.0
 
@@ -383,7 +388,7 @@ class SuperComputerDataset(Dataset):
                 break
             raw_log = raw.decode("latin-1", errors="replace")
             dt, cnt, label = self.source.get_time_content_label(raw_log)
-            cnt = normalize_text(cnt).strip()
+            cnt = self.preprocess_fn(cnt).strip()
             window_times.append(dt)
             window.append(cnt)
             window_raws.append(raw_log)
@@ -584,25 +589,18 @@ class Liberty(Data):
         return dt, cnt, label
 
 
-# ============================================================
-# BalancedSampler с кэшем
-# ============================================================
-
 class BalancedSampler(Sampler):
     """
-    Балансирует классы oversample'ом minority.
-
-    max_oversample_factor: максимум, во сколько раз можно повторить
-        каждый minority-пример за эпоху. Защита от заучивания.
-    min_minority_for_balance: если minority меньше — балансировка
-        отключается, сэмплер работает как uniform.
-    cache_dir: если задан, кэширует индексы на диск (fingerprint по
-        dataset + гиперпараметрам).
+    Балансирующий сэмплер с корректной фильтрацией по valid_range.
+    Индексы вне диапазона отбрасываются ДО расчёта minority_count/total_size
+    → нет утечки при train_ratio < 1 или progressive/mixed обучении.
     """
     def __init__(self, dataset, target_ratio=0.3, max_samples=None,
                  min_samples=1000, seed=None,
                  max_oversample_factor: float = 10.0,
                  min_minority_for_balance: int = 50,
+                 valid_range: typing.Optional[typing.Tuple[int, int]] = None,
+                 use_oversampling: bool = True,
                  cache_dir: typing.Optional[str] = None):
         self.dataset = dataset
         self.target_ratio = target_ratio
@@ -610,23 +608,24 @@ class BalancedSampler(Sampler):
         self.min_samples = min_samples
         self.max_oversample_factor = max_oversample_factor
         self.min_minority_for_balance = min_minority_for_balance
+        self.valid_range = valid_range
+        self.use_oversampling = use_oversampling
         self.cache_dir = cache_dir
+        self.seed = seed
+        self.rng = None
 
-        self.W = dataset.window_size
-        self.N = dataset.total_lines
-        self.step_size = dataset.step_size
+        W, N, step = dataset.window_size, dataset.total_lines, dataset.step_size
 
         fp_payload = {
-            "dataset_fp":  getattr(dataset, "_cache_fp", None),
-            "N":           int(self.N),
-            "W":           int(self.W),
-            "step_size":   int(self.step_size),
+            "dataset_fp": getattr(dataset, "_cache_fp", None),
+            "N": int(N), "W": int(W), "step": int(step),
             "target_ratio": float(target_ratio),
-            "max_samples": str(max_samples),
-            "min_samples": str(min_samples),
-            "seed":        str(seed),
+            "max_samples": str(max_samples), "min_samples": str(min_samples),
+            "seed": str(seed),
             "max_oversample_factor": float(max_oversample_factor),
             "min_minority_for_balance": int(min_minority_for_balance),
+            "valid_range": str(valid_range),
+            "use_oversampling": bool(use_oversampling),
         }
         self._cache_fp = _stable_hash(fp_payload)
         cache_path = self._cache_path()
@@ -635,31 +634,27 @@ class BalancedSampler(Sampler):
         if cache_path:
             data = _safe_load(cache_path)
             if data is not None and data.get("fingerprint") == self._cache_fp:
-                self.normal_indices    = data["normal_indices"]
-                self.anomalous_indices = data["anomalous_indices"]
-                self.minority_label    = data["minority_label"]
-                self.majority_label    = data["majority_label"]
-                self.minority_indices  = data["minority_indices"]
-                self.majority_indices  = data["majority_indices"]
-                self.minority_count    = data["minority_count"]
-                self.total_size        = data["total_size"]
-                self.balance_enabled   = data["balance_enabled"]
+                for k in ("normal_indices", "anomalous_indices",
+                          "minority_label", "majority_label",
+                          "minority_indices", "majority_indices",
+                          "minority_count", "total_size", "balance_enabled"):
+                    setattr(self, k, data[k])
                 print(f"[sampler] cache HIT: {cache_path}")
-                print(f"[sampler] итог (cached): minority={self.minority_count}, "
-                      f"majority={self.total_size - self.minority_count}, "
-                      f"total={self.total_size}, "
-                      f"balance={'ON' if self.balance_enabled else 'OFF'}")
                 loaded = True
 
         if not loaded:
-            labels = self.dataset.labels
-            all_starts = np.arange(0, self.N - self.W + 1,
-                                   self.step_size, dtype=np.int64)
-            prefix = np.zeros(self.N + 1, dtype=np.int64)
+            # ---- фильтрация ДО расчёта статистик ----
+            all_starts = np.arange(0, N - W + 1, step, dtype=np.int64)
+            if valid_range is not None:
+                vmin, vmax = valid_range
+                all_starts = all_starts[(all_starts >= vmin) & (all_starts < vmax)]
+
+            labels = dataset.labels
+            prefix = np.zeros(N + 1, dtype=np.int64)
             prefix[1:] = np.cumsum(labels)
-            has_anom = (prefix[all_starts + self.W]
-                        - prefix[all_starts]) > 0
-            self.normal_indices    = all_starts[~has_anom]
+            has_anom = (prefix[all_starts + W] - prefix[all_starts]) > 0
+
+            self.normal_indices = all_starts[~has_anom]
             self.anomalous_indices = all_starts[has_anom]
 
             if len(self.anomalous_indices) <= len(self.normal_indices):
@@ -671,71 +666,42 @@ class BalancedSampler(Sampler):
                 self.minority_indices = self.normal_indices
                 self.majority_indices = self.anomalous_indices
 
-            n_min = len(self.minority_indices)
-            n_maj = len(self.majority_indices)
+            n_min, n_maj = len(self.minority_indices), len(self.majority_indices)
 
-            print(f'sampler: GLOBAL a={len(self.anomalous_indices)}, '
-                  f'n={len(self.normal_indices)}')
-            t = n_min + n_maj
-            if t > 0:
-                print(f'sampler: frac_a='
-                      f'{len(self.anomalous_indices)/t*100:.2f}%, '
-                      f'frac_n={len(self.normal_indices)/t*100:.2f}%')
-
-            self.balance_enabled = True
-            if n_min == 0:
-                print(f"[sampler] WARNING: minority "
-                      f"({self.minority_label}) = 0")
-                self.balance_enabled = False
-                self.minority_count = 0
-                self.total_size = n_maj
-            elif n_min < self.min_minority_for_balance:
-                print(f"[sampler] WARNING: minority={n_min} < "
-                      f"{self.min_minority_for_balance}. "
-                      f"Балансировка отключена.")
+            if not use_oversampling:
                 self.balance_enabled = False
                 self.minority_count = n_min
                 self.total_size = n_min + n_maj
+                if max_samples is not None and max_samples < self.total_size:
+                    self.total_size = max_samples
+                print(f"[sampler] oversampling OFF: minority={n_min} "
+                      f"majority={n_maj} total={self.total_size}")
+            elif n_min == 0:
+                self.balance_enabled = False
+                self.minority_count = 0
+                self.total_size = n_maj
+                warnings.warn(f"[sampler] minority={self.minority_label} == 0")
+            elif n_min < min_minority_for_balance:
+                self.balance_enabled = False
+                self.minority_count = n_min
+                self.total_size = n_min + n_maj
+                print(f"[sampler] minority={n_min} < {min_minority_for_balance} "
+                      f"→ no oversampling")
             else:
-                target_minority = int((self.target_ratio * n_maj)
-                                      / (1 - self.target_ratio))
-                oversample_cap = int(n_min * self.max_oversample_factor)
-                self.minority_count = max(n_min,
-                                          min(target_minority, oversample_cap))
+                self.balance_enabled = True
+                target_minority = int((target_ratio * n_maj) / (1 - target_ratio))
+                cap = int(n_min * max_oversample_factor)
+                self.minority_count = max(n_min, min(target_minority, cap))
                 self.total_size = self.minority_count + n_maj
-                if self.minority_count < target_minority:
-                    actual = self.minority_count / self.total_size
-                    print(f"[sampler] minority capped: {self.minority_count} "
-                          f"(target был {target_minority}, "
-                          f"cap factor={self.max_oversample_factor}). "
-                          f"Фактический target_ratio={actual:.3f}")
-
-            if self.balance_enabled:
-                if max_samples is not None:
-                    if max_samples > self.total_size:
-                        warnings.warn("max_samples > total")
-                    else:
-                        print(f"total урезали до: {max_samples}")
-                        self.total_size = max_samples
-                        self.minority_count = int(self.total_size
-                                                  * self.target_ratio)
+                if max_samples is not None and max_samples < self.total_size:
+                    self.total_size = max_samples
+                    self.minority_count = int(self.total_size * target_ratio)
                 elif min_samples and self.total_size < min_samples:
-                    print(f"min_samples: увеличено до {min_samples}")
                     self.total_size = min_samples
-                    self.minority_count = int(self.total_size
-                                              * self.target_ratio)
-
-            if n_min == 0:
-                warnings.warn(f"нет окон с меткой {self.minority_label}")
-            if n_maj == 0:
-                warnings.warn("нет окон с меткой мажоритарного класса")
-
-            print(f"[sampler] итог: minority={self.minority_count}, "
-                  f"majority={self.total_size - self.minority_count}, "
-                  f"total={self.total_size}, "
-                  f"balance={'ON' if self.balance_enabled else 'OFF'}, "
-                  f"frac_minority="
-                  f"{self.minority_count / max(self.total_size, 1) * 100:.1f}%")
+                    self.minority_count = int(self.total_size * target_ratio)
+                print(f"[sampler] minority={self.minority_count} "
+                      f"majority={self.total_size - self.minority_count} "
+                      f"total={self.total_size}")
 
             if cache_path:
                 try:
@@ -751,53 +717,100 @@ class BalancedSampler(Sampler):
                         "total_size":        self.total_size,
                         "balance_enabled":   self.balance_enabled,
                     }, cache_path)
-                    print(f"[sampler] cache SAVED: {cache_path}")
                 except Exception as e:
                     print(f"[sampler] cache save failed: {e}")
 
-        self.seed = seed
-        self.rng = None
-
-    def _cache_path(self) -> typing.Optional[str]:
+    def _cache_path(self):
         if not self.cache_dir:
             return None
         return os.path.join(self.cache_dir, f"sampler_{self._cache_fp}.pkl")
 
-    def sample_count(self, array: np.ndarray, count: int) -> np.ndarray:
+    def _sample_count(self, array, count):
+        if count <= 0:
+            return np.array([], dtype=array.dtype)
         if count < len(array):
             return self.rng.choice(array, count, replace=False)
-        else:
-            if len(array) == 0:
-                return array
-            reps, rem = divmod(count, len(array))
-            reps_array = np.tile(array, reps)
-            if rem:
-                reps_array = np.concatenate([
-                    reps_array,
-                    self.rng.choice(array, rem, replace=False),
-                ])
-            self.rng.shuffle(reps_array)
-            return reps_array
+        if len(array) == 0:
+            return array
+        reps, rem = divmod(count, len(array))
+        result = np.tile(array, reps)
+        if rem:
+            result = np.concatenate(
+                [result, self.rng.choice(array, rem, replace=False)])
+        self.rng.shuffle(result)
+        return result
 
     def __iter__(self):
         wi = torch.utils.data.get_worker_info()
         base = self.seed if self.seed is not None else 0
-        self.rng = np.random.default_rng(
-            base + (wi.id if wi is not None else 0))
+        self.rng = np.random.default_rng(base + (wi.id if wi is not None else 0))
 
-        oversampled_minority = self.sample_count(self.minority_indices,
-                                                  self.minority_count)
-        oversampled_majority = self.sample_count(
-            self.majority_indices,
-            self.total_size - self.minority_count)
-        combined = np.concatenate([oversampled_minority,
-                                    oversampled_majority])
+        if not self.balance_enabled:
+            idx = np.concatenate([self.minority_indices, self.majority_indices])
+            if self.max_samples is not None and self.max_samples < len(idx):
+                idx = self.rng.choice(idx, self.max_samples, replace=False)
+            else:
+                self.rng.shuffle(idx)
+            return iter(idx.tolist())
+
+        om = self._sample_count(self.minority_indices, self.minority_count)
+        oj = self._sample_count(self.majority_indices,
+                                self.total_size - self.minority_count)
+        combined = np.concatenate([om, oj])
         self.rng.shuffle(combined)
+        return iter(combined.tolist())
 
-        print(f'sampler: GLOBAL num {self.majority_label}='
-              f'{len(oversampled_majority)}, '
-              f'num {self.minority_label}={len(oversampled_minority)}')
-        return iter(combined)
-
-    def __len__(self) -> int:
+    def __len__(self):
         return self.total_size
+
+# ============================================================
+# Preprocessing registry
+# ============================================================
+
+_REPLACE_PATTERNS = [
+    r'True', r'true', r'False', r'false',
+    r'\b(zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|'
+    r'thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|'
+    r'thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand|million|billion)\b',
+    r'\b(Mon|Monday|Tue|Tuesday|Wed|Wednesday|Thu|Thursday|Fri|Friday|Sat|Saturday|Sun|Sunday)\b',
+    r'\b(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|'
+    r'Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)'
+    r'\s+(\d{1,2})\s+\b',
+    r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}(:\d{1,5})?',
+    r'([0-9A-Fa-f]{2}:){11}[0-9A-Fa-f]{2}',
+    r'([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}',
+    r'[a-zA-Z0-9]*[:\.]*([/\\]+[^/\\\s\[\]]+)+[/\\]*',
+    r'\b[0-9a-fA-F]{8}\b', r'\b[0-9a-fA-F]{10}\b',
+    r'(\w+[\w\.]*)@(\w+[\w\.]*)\-(\w+[\w\.]*)',
+    r'(\w+[\w\.]*)@(\w+[\w\.]*)',
+    r'[a-zA-Z\.\:\-\_]*\d[a-zA-Z0-9\.\:\-\_]*',
+]
+_REPLACE_COMBINED = '|'.join(_REPLACE_PATTERNS)
+_RE_MULTIDOT = re.compile(r'[\.]{3,}')
+
+
+def replace_patterns(text: str) -> str:
+    text = _RE_MULTIDOT.sub('.. ', text)
+    return re.sub(_REPLACE_COMBINED, '<*>', text)
+
+
+def _preproc_none(s):      return s.strip()
+def _preproc_normalize(s): return normalize_text(s).strip()
+def _preproc_replace(s):   return replace_patterns(s).strip()
+def _preproc_both(s):      return normalize_text(replace_patterns(s)).strip()
+
+
+PREPROCESSORS: typing.Dict[str, typing.Callable[[str], str]] = {
+    "none":      _preproc_none,
+    "normalize": _preproc_normalize,   # ваш старый preprocessing
+    "replace":   _preproc_replace,     # LogLLM-style
+    "both":      _preproc_both,
+}
+
+
+def get_preprocess_fn(mode: str) -> typing.Callable[[str], str]:
+    if mode not in PREPROCESSORS:
+        raise ValueError(
+            f"Unknown preprocess mode={mode!r}. "
+            f"Available: {list(PREPROCESSORS.keys())}")
+    return PREPROCESSORS[mode]

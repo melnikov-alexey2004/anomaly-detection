@@ -1,375 +1,241 @@
 """
-Config + run() + continue_training().
+LogLLM runner: Config + collator + tests + 4-stage training + continue_learning.
+
+Stages:
+  stage1 'llama'   — Llama LoRA only (shared template via HF)
+  stage2 'head'    — projector + classifier + aggregator (+ time fusion)
+  stage3 'encoder' — head + encoder LoRA
+  stage4 'all'     — head + encoder + llama LoRA (несколько эпох)
 """
 import os
-import json
 import math
 import time
 import random
-import pickle
 import typing
 import dataclasses
 import datetime as _dt
 
-import tqdm.auto as tqdm
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Sampler
-
-from huggingface_hub import (
-    notebook_login, whoami, HfApi, hf_hub_download, snapshot_download,
+import tqdm.auto as tqdm
+from torch.utils.data import DataLoader, IterableDataset
+from transformers import (
+    AutoTokenizer, get_polynomial_decay_schedule_with_warmup,
+    get_constant_schedule_with_warmup,
 )
-
-from peft import PeftConfig
-from transformers import BitsAndBytesConfig
+from torch.optim.lr_scheduler import LambdaLR
 
 from dataset import (
-    BGL, Tbird, Liberty, Spirit,
+    BGL, Tbird, Spirit, Liberty,
     SuperComputerDataset, EvaluationDataset, BalancedSampler,
+    get_preprocess_fn, normalize_text,
 )
-from model import (
-    load_jasper_encoder, LineEmbeddingCache, make_collate_fn,
-    LogAnomalyModel, EncoderSpec,
-    evaluate, collect_predictions,
-    save_trainable, load_adapter_into,
-    resolve_dtype, make_raw_collate_fn, pack_batch
-)
+from model import LogLLM, ENCODER_PRESETS, resolve_encoder
 
 
 # ============================================================
 # Config
 # ============================================================
 
-import torch
-from transformers import AutoModel, AutoConfig
+def _stub_preprocess(s: str) -> str:
+    """Заглушка: ваш старый preprocessing (normalize_text)."""
+    return normalize_text(s)
 
-def print_model_layers(model_name: str, max_depth: int = 4, max_show: int = 60):
-    print(f"\n{'='*70}\nModel: {model_name}\n{'='*70}")
-
-    cfg = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
-    model = AutoModel.from_pretrained(model_name, config=cfg,
-                                       trust_remote_code=True)
-
-    total = sum(p.numel() for p in model.parameters())
-    print(f"Total parameters: {total:,}")
-    print(f"Hidden size:      {getattr(cfg, 'hidden_size', 'N/A')}")
-    print(f"Num layers:       {getattr(cfg, 'num_hidden_layers', 'N/A')}")
-    print(f"\n{'Layer name':<70} {'Type':<22} {'Shape'}")
-    print("-" * 120)
-
-    layers = []
-    for name, module in model.named_modules():
-        if name.count('.') > max_depth:
-            continue
-        if isinstance(module, (torch.nn.Linear, torch.nn.LayerNorm,
-                                torch.nn.Embedding)):
-            layers.append(name)
-
-    for name in layers[:max_show]:
-        m = dict(model.named_modules())[name]
-        w = getattr(m, 'weight', None)
-        shape = tuple(w.shape) if w is not None else ()
-        print(f"{name:<70} {type(m).__name__:<22} {shape}")
-
-    if len(layers) > max_show:
-        print(f"... и ещё {len(layers) - max_show} слоёв")
-    return model
-
-
-# Использование
-# model = print_model_layers("allenai/longformer-base-4096")
-
-from sentence_transformers import SentenceTransformer
-
-def print_jasper_layers(model_name: str, max_show: int = 40):
-    print(f"\n{'='*70}\nJasper: {model_name}\n{'='*70}")
-
-    st = SentenceTransformer(model_name, trust_remote_code=True,
-                              device="cpu")
-
-    # 1. Собрать все параметры верхнего уровня
-    total = sum(p.numel() for p in st.parameters())
-    trainable = sum(p.numel() for p in st.parameters() if p.requires_grad)
-    print(f"Total parameters:     {total:,}")
-    print(f"Trainable parameters: {trainable:,}  (заморожен? {trainable == 0})")
-    print()
-
-    # 2. Основной энкодер внутри SentenceTransformer
-    inner = st[0] if len(st) > 0 else None
-    print(f"First module: {type(inner).__name__}")
-    if hasattr(inner, 'auto_model'):
-        am = inner.auto_model
-        print(f"  auto_model: {type(am).__name__}")
-        print(f"  hidden_size: {am.config.hidden_size}")
-        print(f"  num_layers:  {am.config.num_hidden_layers}")
-
-        # 3. Слои внутренней модели
-        print(f"\n{'Layer name':<70} {'Type':<22} {'Shape'}")
-        print("-" * 120)
-        count = 0
-        for name, module in am.named_modules():
-            if isinstance(module, torch.nn.Linear) and count < max_show:
-                w = getattr(module, 'weight', None)
-                shape = tuple(w.shape) if w is not None else ()
-                print(f"{name:<70} {type(module).__name__:<22} {shape}")
-                count += 1
-
-    return st
-# st = print_jasper_layers("infgrad/Jasper-Token-Compression-600M")
-
-import torch, torch.nn as nn
-
-
-def print_custom_model_layers(model, max_depth: int = 4, max_show: int = 60):
-    print(f"\n{'='*70}\nModel: {type(model).__name__}\n{'='*70}")
-
-    total = sum(p.numel() for p in model.parameters())
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Total parameters:     {total:,}")
-    print(f"Trainable parameters: {trainable:,}  "
-          f"({trainable/total*100:.2f}%)")
-    print(f"\n{'Layer name':<70} {'Type':<22} {'Shape'}")
-    print("-" * 120)
-
-    layers = []
-    for name, module in model.named_modules():
-        if name.count('.') > max_depth:
-            continue
-        if isinstance(module, (torch.nn.Linear, torch.nn.LayerNorm,
-                                torch.nn.Embedding, torch.nn.GRU,
-                                torch.nn.LSTM, torch.nn.MultiheadAttention,
-                                torch.nn.Conv1d, torch.nn.Conv2d)):
-            layers.append(name)
-
-    for name in layers[:max_show]:
-        m = dict(model.named_modules())[name]
-        w = getattr(m, 'weight', None)
-        shape = tuple(w.shape) if w is not None else ()
-        print(f"{name:<70} {type(m).__name__:<22} {shape}")
-
-    if len(layers) > max_show:
-        print(f"... и ещё {len(layers) - max_show} слоёв")
-    return model
-
-
-# Пример для GRUAttentionModel
-# print_custom_model_layers(model)
-
-def inspect_model(model, max_depth: int = 4, max_show: int = 60):
-    """
-    Универсальный осмотр: Longformer/RoBERTa/кастом/Jasper.
-    """
-    from transformers import PreTrainedModel
-
-    # Jasper-обёртка: разворачиваем
-    try:
-        from sentence_transformers import SentenceTransformer
-        if isinstance(model, SentenceTransformer):
-            print(f"[inspect] SentenceTransformer, разворачиваем в auto_model")
-            for m in model:
-                if hasattr(m, 'auto_model'):
-                    model = m.auto_model
-                    break
-    except Exception:
-        pass
-
-    # Longformer/RoBERTa/любой HF
-    if isinstance(model, PreTrainedModel):
-        print(f"[inspect] HF model: {type(model).__name__}")
-        cfg = model.config
-        print(f"  hidden_size: {getattr(cfg, 'hidden_size', 'N/A')}")
-        print(f"  num_layers:  {getattr(cfg, 'num_hidden_layers', 'N/A')}")
-
-    total = sum(p.numel() for p in model.parameters())
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"  total params:     {total:,}")
-    print(f"  trainable params: {trainable:,} ({trainable/total*100:.2f}%)")
-
-    print(f"\n{'Layer name':<70} {'Type':<22} {'Shape'}")
-    print("-" * 120)
-
-    layers = []
-    for name, module in model.named_modules():
-        if name.count('.') > max_depth:
-            continue
-        if isinstance(module, (torch.nn.Linear, torch.nn.LayerNorm,
-                                torch.nn.Embedding, torch.nn.GRU,
-                                torch.nn.LSTM, torch.nn.MultiheadAttention)):
-            layers.append(name)
-
-    for name in layers[:max_show]:
-        m = dict(model.named_modules())[name]
-        w = getattr(m, 'weight', None)
-        shape = tuple(w.shape) if w is not None else ()
-        print(f"{name:<70} {type(m).__name__:<22} {shape}")
-
-    if len(layers) > max_show:
-        print(f"... и ещё {len(layers) - max_show}")
-    return model
 
 @dataclasses.dataclass
 class Config:
-    # ---------- данные ----------
-    dataset: str = "bgl"
+    # ---- data ----
+    dataset: str = "liberty"
     win_size: int = 199
     step_size: int = 199
     anchor_step: int = 10
     batch_size: int = 16
-    num_workers: int = 0
+    num_workers: int = 4
     use_in_colab: bool = True
     max_lines: typing.Optional[int] = None
     start_line: int = 0
     end_line: typing.Optional[int] = None
 
-    # кэш
+    # ---- preprocessing ----
+    # preprocess_mode (if set) takes priority over preprocess_fn.
+    preprocess_fn: typing.Callable[[str], str] = dataclasses.field(
+        default=_stub_preprocess)
+    preprocess_mode: typing.Optional[str] = None   # "none"|"normalize"|"replace"|"both"
+
+    # ---- cache ----
     use_cache: bool = True
     cache_dir: str = "/content/cache"
 
-    # ---------- доли ----------
+    # ---- split ----
     eval_start_ratio: float = 0.9
     train_ratio: float = 0.3
     target_ratio: float = 0.3
 
-    # ---------- eval ----------
-    eval_max_windows: typing.Optional[int] = 2000
-    metrics_log_every: int = 100
-    final_full_eval: bool = True
+    # ---- per-stage progressive data ----
+    stage_train_ratios: typing.Optional[typing.Dict[int, float]] = None
+    stage_min_ratios: typing.Optional[typing.Dict[int, float]] = None
 
-    # ---------- временные признаки ----------
-    time_emb_len: int = 16
+    # ---- ablation ----
+    use_oversampling: bool = True
+
+    # ---- encoder ----
+    encoder: str = "bert-base"                    # preset name OR hf path
+    encoder_overrides: typing.Optional[typing.Dict] = None
+    encoder_lora_r: int = 8
+    encoder_lora_alpha: int = 16
+    encoder_lora_targets: typing.Optional[typing.List[str]] = None
+    encoder_quantize: bool = False
+    encoder_last_layers: int = 1
+    encoder_layer_agg: str = "last"     # "last"|"mean"|"weighted"|"attn_pool"
+    encoder_pooling: str = "mean"       # "cls"|"mean"|"max"
+
+    # ---- Llama 3 / 3.1 / 3.2 ----
+    llama_path: str = "meta-llama/Meta-Llama-3-8B"
+    llama_lora_r: int = 16
+    llama_lora_alpha: int = 32
+
+    # ---- compute dtype ----
+    compute_dtype: str = "bf16"         # "bf16"|"fp16"|"fp32"|"tf32"
+
+    # ---- HF ----
+    hf_token: typing.Optional[str] = None
+    template_repo_id: typing.Optional[str] = None
+    use_shared_template: bool = True
+
+    # ---- collator ----
+    max_content_len: int = 128
+
+    # ---- time fusion ----
+    use_time_features: bool = True
+    fusion_type: str = "cross_attention"   # "cross_attention"|"concat"|"projector"|"none"
     use_time2vec: bool = True
     use_cyclic_time: bool = True
-    use_time_present: bool = True
+    time_emb_len: int = 16
 
-    # ---------- Jasper ----------
-    jasper_model_name: str = "infgrad/Jasper-Token-Compression-600M"
-    compression_ratio: float = 0.5
-    jasper_batch: int = 64
-    cache_max_lines: int = 50_000
-
-    # ---------- Longformer ----------
-    longformer_model_name: str = "allenai/longformer-base-4096"
-    longformer_layers: int = 12
-    longformer_attention_window: int = 100
-
-    # ---------- выбор энкодера / модели ----------
-    encoder_type: str = "longformer"
-    encoder_factory: typing.Optional[typing.Callable] = None
-    model_factory:   typing.Optional[typing.Callable] = None
-
-    # ---------- агрегация ----------
-    aggregate_layers: int = 4
-    aggregate_mode: str = "weighted"
-    use_learned_cls: bool = True
-
-    # ---------- dtype / квантизация / FP8 ----------
-    model_dtype: str = "bf16"                              # bf16 | fp16 | fp32 | tf32
-    quantization_config: typing.Optional[BitsAndBytesConfig] = None
-    fp8_training: bool = False
-    fp8_backend: str = "torchao"
-    fp8_recipe: str = "rowwise"
-
-    # ---------- PEFT ----------
-    peft_config: typing.Optional[PeftConfig] = None
-
-    # ---------- обучение ----------
-    num_epochs: int = 3
-    learning_rate: float = 5e-5
-    lr_end: float = 1e-7
+    # ---- training ----
+    grad_accum_steps: int = 4
     weight_decay: float = 0.05
     warmup_steps: int = 200
-    scheduler_type: str = "linear"
     grad_clip: float = 1.0
-    seed: int = 42
 
-    # ---------- sampler ----------
+    # ---- scheduler ----
+    scheduler_type: str = "polynomial"   # "polynomial"|"linear"|"cosine"|"constant"
+    poly_power: float = 1.0
+    min_lr: float = 1e-7
+    cosine_min_ratio: float = 0.0
+
+    # ---- stages ----
+    n_epochs_stage1: int = 1
+    n_epochs_stage2: int = 1
+    n_epochs_stage3: int = 1
+    n_epochs_stage4: int = 3
+    lr_stage1: float = 5e-4
+    lr_stage2: float = 5e-4
+    lr_stage3: float = 5e-5
+    lr_stage4: float = 2e-5
+    template_max_samples: int = 1000
+
+    # ---- eval ----
+    eval_max_windows: typing.Optional[int] = 2000
+
+    # ---- sampler ----
     sampler_max_oversample: float = 10.0
     sampler_min_minority: int = 50
     max_samples: typing.Optional[int] = None
     min_samples: typing.Optional[int] = None
 
-    # ---------- train mode ----------
-    train_mode: str = "all"
-    mixed_prev_fraction: float = 0.1
+    # ---- continue_learning ----
+    resume_from: typing.Optional[str] = None
+    resume_subdir: typing.Optional[str] = None
+    resume_from_stage: str = "stage4"
+    resume_next_stage: bool = False
+    resume_n_epochs: typing.Optional[int] = None
 
-    # ---------- predictions ----------
-    save_predictions: bool = True
-    predictions_dir: str = "/content/predictions"
-
-    # ---------- Hub ----------
-    push_to_hub: bool = True
-    hub_repo_id: typing.Optional[str] = None
+    # ---- misc ----
+    seed: int = 42
+    save_dir: str = "/content/checkpoints"
     run_tag: typing.Optional[str] = None
-    resume_from_repo: typing.Optional[str] = None
-    resume_from_run_tag: typing.Optional[str] = None
+    push_to_hub: bool = False
+    hub_repo_id: typing.Optional[str] = None
 
 
 # ============================================================
-# Config <-> JSON
+# Helpers
 # ============================================================
 
-def cfg_to_json_dict(cfg: Config) -> dict:
+_DATASET_CLS = {"bgl": BGL, "tbird": Tbird, "spirit": Spirit, "liberty": Liberty}
+_STAGE_ORDER = ["stage1", "stage2", "stage3", "stage4"]
+_STAGE_MODE = {"stage1": "llama", "stage2": "head",
+               "stage3": "encoder", "stage4": "all"}
+
+
+def _get_preprocess(cfg: Config):
+    if cfg.preprocess_mode is not None:
+        return get_preprocess_fn(cfg.preprocess_mode)
+    return cfg.preprocess_fn
+
+
+def _cfg_for_save(cfg: Config) -> dict:
     d = dataclasses.asdict(cfg)
-    out = {}
-    for k, v in d.items():
-        if isinstance(v, torch.dtype):
-            out[k] = str(v)
-        elif k == "quantization_config":
-            if v is None:
-                out[k] = None
-            else:
-                out[k] = {"_type": type(v).__name__,
-                          **{kk: str(vv) for kk, vv in v.to_dict().items()}}
-        elif k == "peft_config":
-            if v is None:
-                out[k] = None
-            else:
-                out[k] = {"_type": type(v).__name__,
-                          **{kk: str(vv) for kk, vv in v.to_dict().items()}}
-        elif k in ("encoder_factory", "model_factory"):
-            out[k] = (None if v is None
-                      else f"<callable {getattr(v, '__name__', v)}>")
-        else:
-            out[k] = v
-    return out
+    d.pop("preprocess_fn", None)
+    return d
 
 
-def cfg_to_json(cfg: Config) -> str:
-    return json.dumps(cfg_to_json_dict(cfg), indent=2, ensure_ascii=False)
+def _build_dataset(cfg: Config, preprocess=None):
+    data_cls = _DATASET_CLS[cfg.dataset]
+    max_lines = math.inf if cfg.max_lines is None else cfg.max_lines
+    d = data_cls(
+        window_size=cfg.win_size, step_size=cfg.step_size,
+        max_lines=max_lines, start_line=cfg.start_line,
+        end_line=cfg.end_line, use_in_colab=cfg.use_in_colab)
+    cache_root = cfg.cache_dir if cfg.use_cache else None
+    if cache_root:
+        os.makedirs(cache_root, exist_ok=True)
+    return SuperComputerDataset(
+        d, cfg.anchor_step, train_ratio=cfg.eval_start_ratio,
+        cache_dir=cache_root,
+        preprocess_fn=preprocess or _get_preprocess(cfg))
 
 
-# ============================================================
-# Samplers
-# ============================================================
+class LogLLMCollator:
+    def __init__(self, encoder_tokenizer, max_content_len: int = 128):
+        self.tok = encoder_tokenizer
+        self.max_content_len = max_content_len
 
-class FilteredSampler(Sampler):
-    def __init__(self, base, max_start: int, min_start: int = 0):
-        self.base = base
-        self.max_start = max_start
-        self.min_start = min_start
-        self._indices = None
+    def __call__(self, batch):
+        windows, times, labels = [], [], []
+        for window, window_times, _raws, label in batch:
+            if not window:
+                continue
+            windows.append(window)
+            times.append(window_times)
+            labels.append(float(label))
+        if not windows:
+            return None
 
-    def _materialize(self):
-        if self._indices is None:
-            self._indices = np.asarray(
-                [int(i) for i in self.base
-                 if self.min_start <= int(i) < self.max_start],
-                dtype=np.int64)
+        flat = [line for w in windows for line in w]
+        positions, pos = [], 0
+        for w in windows[:-1]:
+            pos += len(w)
+            positions.append(pos)
 
-    def __iter__(self):
-        self._materialize()
-        yield from self._indices.tolist()
+        enc_inputs = self.tok(
+            flat, return_tensors="pt",
+            max_length=self.max_content_len,
+            padding=True, truncation=True)
 
-    def __len__(self):
-        self._materialize()
-        return int(len(self._indices))
+        return {
+            "bert_inputs": enc_inputs,
+            "seq_positions": torch.tensor(positions, dtype=torch.long),
+            "times": times,
+            "labels": torch.tensor(labels, dtype=torch.float32),
+        }
 
 
-class LimitedIterable(torch.utils.data.IterableDataset):
+class LimitedIterable(IterableDataset):
     def __init__(self, base, max_items):
-        self.base = base
-        self.max_items = max_items
+        self.base, self.max_items = base, max_items
 
     def __iter__(self):
         if self.max_items is None:
@@ -381,372 +247,357 @@ class LimitedIterable(torch.utils.data.IterableDataset):
             yield x
 
     def __len__(self):
-        if self.max_items is None:
-            return len(self.base)
-        return min(len(self.base), self.max_items)
-
-
-class RangeSampler(Sampler):
-    def __init__(self, start: int, end: int, step: int):
-        self.indices = list(range(start, end, step))
-
-    def __iter__(self):
-        return iter(self.indices)
-
-    def __len__(self):
-        return len(self.indices)
+        return len(self.base) if self.max_items is None \
+               else min(len(self.base), self.max_items)
 
 
 # ============================================================
-# HF
+# Scheduler
 # ============================================================
 
-def ensure_login():
-    try:
-        whoami()
-    except Exception:
-        notebook_login()
+def _build_scheduler(optimizer, total_steps: int, cfg: Config, max_lr: float):
+    warmup = min(cfg.warmup_steps, max(1, total_steps // 10))
+    sched = cfg.scheduler_type.lower()
+    min_lr = float(cfg.min_lr)
+    if cfg.cosine_min_ratio > 0:
+        min_lr = float(max_lr) * float(cfg.cosine_min_ratio)
 
+    if sched in ("polynomial", "linear"):
+        power = 1.0 if sched == "linear" else float(cfg.poly_power)
+        print(f"[sched] {sched} power={power} max_lr={max_lr:.2e} "
+              f"min_lr={min_lr:.2e} warmup={warmup} total={total_steps}")
+        return get_polynomial_decay_schedule_with_warmup(
+            optimizer, num_warmup_steps=warmup,
+            num_training_steps=total_steps,
+            lr_end=min_lr, power=power)
 
-def resolve_repo_id(cfg) -> str:
-    if cfg.hub_repo_id:
-        return cfg.hub_repo_id
-    user = whoami()["name"]
-    return f"{user}/{cfg.dataset}-log-anomaly"
+    if sched == "cosine":
+        def fn(step):
+            if step < warmup:
+                lr = min_lr + (max_lr - min_lr) * step / max(1, warmup)
+            else:
+                denom = max(1, total_steps - warmup)
+                p = min(1.0, (step - warmup) / denom)
+                lr = min_lr + 0.5 * (max_lr - min_lr) * (1.0 + math.cos(math.pi * p))
+            return lr / max_lr
+        print(f"[sched] cosine max_lr={max_lr:.2e} min_lr={min_lr:.2e} "
+              f"warmup={warmup} total={total_steps}")
+        return LambdaLR(optimizer, fn)
 
+    if sched == "constant":
+        print(f"[sched] constant max_lr={max_lr:.2e} warmup={warmup}")
+        return get_constant_schedule_with_warmup(
+            optimizer, num_warmup_steps=warmup)
 
-def ensure_repo(repo_id: str):
-    HfApi().create_repo(repo_id, repo_type="model", exist_ok=True)
-
-
-def upload_file(local_path, repo_id, path_in_repo):
-    HfApi().upload_file(path_or_fileobj=local_path,
-                        path_in_repo=path_in_repo,
-                        repo_id=repo_id, repo_type="model")
-
-
-def upload_folder(local_dir, repo_id, path_in_repo):
-    HfApi().upload_folder(folder_path=local_dir,
-                          path_in_repo=path_in_repo,
-                          repo_id=repo_id, repo_type="model")
-
-
-def download_folder(repo_id, path_in_repo, local_dir):
-    os.makedirs(local_dir, exist_ok=True)
-    snapshot_download(repo_id=repo_id, repo_type="model",
-                      allow_patterns=[f"{path_in_repo}/**"],
-                      local_dir=local_dir)
-
-
-# ============================================================
-# train_loop
-# ============================================================
-
-def train_loop(model, optimizer, scheduler, train_loader,
-               val_loader_small, val_loader_full, criterion, cfg, device,
-               line_cache, ds, append_metric, history,
-               start_epoch: int, global_step: int,
-               repo_id: typing.Optional[str]):
-    end_epoch = start_epoch + cfg.num_epochs
-    print(f"[train_loop] epochs {start_epoch}..{end_epoch-1} "
-          f"(global_step={global_step})")
-
-    epochs_bar = tqdm.trange(start_epoch, end_epoch, desc="training")
-    for epoch in epochs_bar:
-        model.train()
-        running, n_run = 0.0, 0
-        t0 = time.time()
-
-        pbar = tqdm.tqdm(train_loader, desc=f"epoch {epoch}", leave=True)
-        for step, raw_batch in enumerate(pbar):
-            batch = pack_batch(raw_batch, line_cache, device)
-            if batch is None:
-                continue
-            log_embs = batch["log_embs"].to(device)
-            mask = batch["attention_mask"].to(device)
-            y = batch["labels"].to(device)
-
-            optimizer.zero_grad()
-            logits = model(log_embs, batch["times"], mask)
-            loss = criterion(logits.float(), y)
-
-            if torch.isnan(loss) or torch.isinf(loss):
-                print(f"[skip] NaN/Inf loss at step {global_step}")
-                optimizer.zero_grad()
-                continue
-
-            loss.backward()
-            if cfg.grad_clip:
-                torch.nn.utils.clip_grad_norm_(
-                    [p for p in model.parameters() if p.requires_grad],
-                    cfg.grad_clip)
-
-            has_bad_grad = any(
-                p.grad is not None and
-                (torch.isnan(p.grad).any() or torch.isinf(p.grad).any())
-                for p in model.parameters() if p.requires_grad)
-            if has_bad_grad:
-                print(f"[skip] NaN/Inf grad at step {global_step}")
-                optimizer.zero_grad()
-                continue
-
-            optimizer.step()
-            scheduler.step()
-
-            running += loss.item()
-            n_run += 1
-            global_step += 1
-
-            pbar.set_postfix({
-                "loss": f"{running / max(n_run, 1):.3f}",
-                "lr": f"{scheduler.get_last_lr()[0]:.2e}",
-            })
-
-            if cfg.metrics_log_every and (step + 1) % cfg.metrics_log_every == 0:
-                ev = evaluate(model, val_loader_small, device, criterion, line_cache,
-                              max_windows=cfg.eval_max_windows)
-                rec = {
-                    "run_tag": cfg.run_tag,
-                    "epoch": epoch,
-                    "global_step": global_step,
-                    "phase": "intra_epoch",
-                    "train_loss": running / max(n_run, 1),
-                    "eval": ev,
-                    "train_ratio": cfg.train_ratio,
-                    "eval_start_ratio": cfg.eval_start_ratio,
-                    "target_ratio": cfg.target_ratio,
-                    "elapsed_sec": time.time() - t0,
-                }
-                append_metric(rec)
-                print(f"[e{epoch} s{global_step}] "
-                      f"train={running/max(n_run,1):.4f} "
-                      f"lr={scheduler.get_last_lr()[0]:.2e} "
-                      f"elapsed={time.time() - t0:.0f}s "
-                      f"eval_f1={ev['f1']:.4f} "
-                      f"P={ev['precision']:.3f} R={ev['recall']:.3f} "
-                      f"n={ev['n_windows']}")
-                model.train()
-
-        ev = evaluate(model, val_loader_small, device, criterion, line_cache,
-                      max_windows=cfg.eval_max_windows)
-        rec = {
-            "run_tag": cfg.run_tag,
-            "epoch": epoch,
-            "global_step": global_step,
-            "phase": "end_of_epoch",
-            "train_loss": running / max(n_run, 1),
-            "eval": ev,
-            "train_ratio": cfg.train_ratio,
-            "eval_start_ratio": cfg.eval_start_ratio,
-            "target_ratio": cfg.target_ratio,
-            "elapsed_sec": time.time() - t0,
-        }
-        append_metric(rec)
-        print(f"[end e{epoch}] "
-              f"loss={running / max(n_run, 1):.4f} "
-              f"lr={scheduler.get_last_lr()[0]:.2e} "
-              f"elapsed={time.time() - t0:.0f}s "
-              f"F1={ev['f1']:.4f} P={ev['precision']:.3f} "
-              f"R={ev['recall']:.3f} n={ev['n_windows']} "
-              f"cache: {line_cache.stats()}")
-
-        local_ckpt = f"/content/ckpt_{cfg.run_tag}_e{epoch}"
-        save_trainable(model, optimizer, scheduler, epoch + 1,
-                       global_step, local_ckpt)
-        if repo_id:
-            upload_folder(local_ckpt, repo_id,
-                          f"runs/{cfg.run_tag}/epoch_{epoch:02d}")
-            upload_folder(os.path.join(local_ckpt, "adapter"), repo_id,
-                          f"runs/{cfg.run_tag}/adapter")
-            upload_file(os.path.join(local_ckpt, "train_state.pt"),
-                        repo_id, f"runs/{cfg.run_tag}/train_state.pt")
-        print(f"[save] epoch {epoch} -> {local_ckpt}")
-
-        if cfg.save_predictions:
-            _save_predictions(model, ds, train_loader, val_loader_small,
-                              cfg, device, line_cache,
-                              epoch=epoch, phase="epoch")
-
-    if cfg.final_full_eval:
-        ev = evaluate(model, val_loader_full, device, criterion, line_cache,
-                      max_windows=None, desc="final full eval")
-        rec = {
-            "run_tag": cfg.run_tag,
-            "epoch": end_epoch - 1,
-            "global_step": global_step,
-            "phase": "final_full",
-            "eval": ev,
-            "train_ratio": cfg.train_ratio,
-            "eval_start_ratio": cfg.eval_start_ratio,
-            "target_ratio": cfg.target_ratio,
-        }
-        append_metric(rec)
-        print(f"[final full eval] f1={ev['f1']:.4f} "
-              f"P={ev['precision']:.3f} R={ev['recall']:.3f} "
-              f"n={ev['n_windows']} (pos={ev['n_pos']})")
-
-        if cfg.save_predictions:
-            _save_predictions(model, ds, train_loader, val_loader_full,
-                              cfg, device, line_cache,
-                              epoch=end_epoch - 1, phase="final")
-
-    return end_epoch, global_step
+    raise ValueError(f"unknown scheduler_type={cfg.scheduler_type!r}")
 
 
 # ============================================================
-# Вспомогательные
+# HF helpers
 # ============================================================
 
-_DATASET_CLS = {"bgl": BGL, "tbird": Tbird, "spirit": Spirit,
-                "liberty": Liberty}
-
-
-def _log_zone_distribution(base_sampler, safe_min, safe_max, name="zone"):
-    min_idx = base_sampler.minority_indices
-    maj_idx = base_sampler.majority_indices
-    if base_sampler.minority_label == "abnormal":
-        abnorm_idx, normal_idx = min_idx, maj_idx
+def _login_hf(cfg: Config) -> str:
+    token = (cfg.hf_token
+             or os.environ.get("HF_TOKEN")
+             or os.environ.get("HUGGING_FACE_HUB_TOKEN"))
+    from huggingface_hub import login, whoami, notebook_login
+    if token:
+        login(token=token, add_to_git_credential=False)
+        print("[hf] logged in via token")
     else:
-        abnorm_idx, normal_idx = maj_idx, min_idx
-
-    mask_a = (abnorm_idx >= safe_min) & (abnorm_idx < safe_max)
-    mask_n = (normal_idx >= safe_min) & (normal_idx < safe_max)
-    n_abnorm, n_normal = int(mask_a.sum()), int(mask_n.sum())
-    total = n_abnorm + n_normal
-    if total == 0:
-        print(f"[{name}] зона [{safe_min}, {safe_max}): окон нет")
-        return
-    print(f"[{name}] зона [{safe_min}, {safe_max}): "
-          f"окон={total}, abnormal={n_abnorm} "
-          f"({n_abnorm/total*100:.2f}%), normal={n_normal} "
-          f"({n_normal/total*100:.2f}%)")
+        try:
+            whoami()
+            print("[hf] already logged in")
+        except Exception:
+            notebook_login()
+    return whoami()["name"]
 
 
-def _build_loaders(ds, val_ds, cfg, line_cache, base_sampler=None):
-    collate = make_raw_collate_fn()
-    val_loader_small = DataLoader(
-        LimitedIterable(val_ds, cfg.eval_max_windows),
-        batch_size=cfg.batch_size, shuffle=False,
-        collate_fn=collate, num_workers=cfg.num_workers)
-    val_loader_full = DataLoader(
-        val_ds, batch_size=cfg.batch_size, shuffle=False,
-        collate_fn=collate, num_workers=cfg.num_workers)
-    if base_sampler is not None:
-        _log_zone_distribution(base_sampler, val_ds.start_line,
-                               val_ds.end_line, name="eval_zone")
-    return val_loader_small, val_loader_full
+def _resolve_template_repo(cfg: Config, user_name: str) -> str:
+    return cfg.template_repo_id or f"{user_name}/llama3-8b-template"
 
 
-def _build_train_loader(ds, eval_start_line, cfg, line_cache,
-                        base_sampler=None, prev_train_limit=None):
-    train_limit = int(ds.total_lines * cfg.train_ratio)
-    safe_max = max(0, min(train_limit, eval_start_line - cfg.win_size))
+def _template_exists(repo_id: str) -> bool:
+    from huggingface_hub import HfApi
+    try:
+        files = HfApi().list_repo_files(repo_id, repo_type="model")
+    except Exception:
+        return False
+    return any(f.startswith("llama_lora/") for f in files)
 
-    if base_sampler is None:
-        print("[sampler] строим BalancedSampler...")
-        cache_root = cfg.cache_dir if cfg.use_cache else None
-        base_sampler = BalancedSampler(
+
+def _save_llama_template(model, repo_id: str):
+    from huggingface_hub import HfApi
+    api = HfApi()
+    api.create_repo(repo_id, repo_type="model", exist_ok=True)
+    local = "/tmp/llama3_template"
+    os.makedirs(os.path.join(local, "llama_lora"), exist_ok=True)
+    model.llama.save_pretrained(os.path.join(local, "llama_lora"))
+    api.upload_folder(folder_path=local, repo_id=repo_id,
+                      path_in_repo=".", repo_type="model")
+    print(f"[template] saved → {repo_id}")
+
+
+def _load_llama_template(model, repo_id: str):
+    from huggingface_hub import snapshot_download
+    from peft import set_peft_model_state_dict
+    from safetensors.torch import load_file
+    local = snapshot_download(repo_id=repo_id, repo_type="model",
+                               allow_patterns=["llama_lora/**"])
+    fp = os.path.join(local, "llama_lora", "adapter_model.safetensors")
+    if not os.path.exists(fp):
+        raise FileNotFoundError(fp)
+    state = load_file(fp)
+    set_peft_model_state_dict(model.llama, state)
+    print(f"[template] loaded ← {repo_id} ({len(state)} keys)")
+
+
+# ============================================================
+# Loaders
+# ============================================================
+
+def _build_loaders(cfg: Config, ds, val_ds, collator, stage_idx: int,
+                    template_only: bool = False):
+    ratio = cfg.train_ratio
+    if cfg.stage_train_ratios and stage_idx in cfg.stage_train_ratios:
+        ratio = cfg.stage_train_ratios[stage_idx]
+    min_ratio = 0.0
+    if cfg.stage_min_ratios and stage_idx in cfg.stage_min_ratios:
+        min_ratio = cfg.stage_min_ratios[stage_idx]
+
+    train_limit = int(ds.total_lines * ratio)
+    safe_max = max(0, min(train_limit, val_ds.start_line - cfg.win_size))
+    safe_min = min(int(ds.total_lines * min_ratio), safe_max) if min_ratio > 0 else 0
+
+    if template_only:
+        sampler = BalancedSampler(
+            ds, target_ratio=0.5, seed=cfg.seed,
+            max_samples=cfg.template_max_samples, min_samples=None,
+            max_oversample_factor=cfg.sampler_max_oversample,
+            min_minority_for_balance=10,
+            valid_range=(safe_min, safe_max),
+            use_oversampling=True, cache_dir=None)
+    else:
+        sampler = BalancedSampler(
             ds, target_ratio=cfg.target_ratio, seed=cfg.seed,
-            min_samples=cfg.min_samples, max_samples=cfg.max_samples,
+            max_samples=cfg.max_samples, min_samples=cfg.min_samples,
             max_oversample_factor=cfg.sampler_max_oversample,
             min_minority_for_balance=cfg.sampler_min_minority,
-            cache_dir=cache_root)
-        print("[sampler] готов")
-    else:
-        print("[sampler] переиспользуем существующий BalancedSampler")
+            valid_range=(safe_min, safe_max),
+            use_oversampling=cfg.use_oversampling,
+            cache_dir=cfg.cache_dir if cfg.use_cache else None)
 
-    safe_min = 0
-    if prev_train_limit is not None and prev_train_limit > 0:
-        safe_min = min(prev_train_limit, safe_max)
-        print(f"[loader] РЕЖИМ: только новые данные, "
-              f"окна в [{safe_min}, {safe_max})")
+    print(f"[loaders] stage{stage_idx} ratio={ratio} "
+          f"safe=[{safe_min},{safe_max}) sampler_len={len(sampler)}"
+          f"{' (template)' if template_only else ''}")
 
-    train_sampler = FilteredSampler(base_sampler, max_start=safe_max,
-                                     min_start=safe_min)
-    collate = make_raw_collate_fn()
     train_loader = DataLoader(
-        ds, batch_size=cfg.batch_size, sampler=train_sampler,
-        collate_fn=collate, num_workers=cfg.num_workers)
-    print(f"[loader] train_ratio={cfg.train_ratio} -> "
-          f"train_limit={train_limit} safe_min={safe_min} "
-          f"safe_max={safe_max} окон={len(train_sampler)}")
-    _log_zone_distribution(base_sampler, safe_min, safe_max,
-                           name=f"train_zone r={cfg.train_ratio}")
-    return train_loader, base_sampler
+        ds, batch_size=cfg.batch_size, sampler=sampler,
+        collate_fn=collator, num_workers=cfg.num_workers,
+        drop_last=True, persistent_workers=cfg.num_workers > 0)
+    val_loader = DataLoader(
+        LimitedIterable(val_ds, cfg.eval_max_windows),
+        batch_size=cfg.batch_size, shuffle=False,
+        collate_fn=collator, num_workers=cfg.num_workers)
+    return train_loader, val_loader
 
 
-def _build_scheduler(optimizer, total_steps, cfg):
-    if cfg.scheduler_type == "cosine":
-        return torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=total_steps)
-    from transformers import get_polynomial_decay_schedule_with_warmup
-    return get_polynomial_decay_schedule_with_warmup(
-        optimizer,
-        num_warmup_steps=cfg.warmup_steps,
-        num_training_steps=total_steps,
-        lr_end=cfg.lr_end,
-        power=1)
+# ============================================================
+# Tests
+# ============================================================
+
+def test_preprocessing(cfg: Config, n_samples: int = 10):
+    data_cls = _DATASET_CLS[cfg.dataset]
+    max_lines = math.inf if cfg.max_lines is None else cfg.max_lines
+    d = data_cls(
+        window_size=cfg.win_size, step_size=cfg.step_size,
+        max_lines=max_lines, start_line=cfg.start_line,
+        end_line=cfg.end_line, use_in_colab=cfg.use_in_colab)
+    preprocess = _get_preprocess(cfg)
+    spec = resolve_encoder(cfg.encoder, cfg.encoder_overrides)
+    tok = AutoTokenizer.from_pretrained(spec["path"])
+
+    label = ("mode=" + repr(cfg.preprocess_mode)
+             if cfg.preprocess_mode else "custom fn")
+    print(f"\n{'='*90}\nPreprocessing test | {label} | "
+          f"encoder={spec['path']}\nlog={d.path_to_log}\n{'='*90}\n")
+
+    shown, skipped = 0, 0
+    with open(d.path_to_log, "rb") as f:
+        while shown < n_samples:
+            raw = f.readline()
+            if not raw:
+                break
+            line = raw.decode("latin-1", errors="replace")
+            dt, raw_cnt, lab = d.get_time_content_label(line)
+            if not raw_cnt:
+                skipped += 1
+                continue
+            proc = preprocess(raw_cnt)
+            ids = tok(proc, truncation=False)["input_ids"]
+            print(f"--- [{shown}] label={lab} time={dt} ---")
+            print(f"RAW  : {raw_cnt!r}")
+            print(f"PROC : {proc!r}")
+            print(f"TOKENS ({len(ids)}): "
+                  f"{tok.convert_ids_to_tokens(ids)[:30]}"
+                  f"{'...' if len(ids) > 30 else ''}\n")
+            shown += 1
+    if skipped:
+        print(f"(skipped {skipped} lines with empty Content)")
 
 
-def _build_model(cfg, jasper_dim, device):
-    if getattr(cfg, "model_factory", None) is not None:
-        print("[model] using custom model_factory")
-        model = cfg.model_factory(cfg, jasper_dim, device)
-    else:
-        model = LogAnomalyModel(cfg, jasper_dim, device)
+def test_dataloader(cfg: Config, n_windows: int = 3):
+    ds = _build_dataset(cfg)
+    val_ds = EvaluationDataset(ds)
+    train_limit = int(ds.total_lines * cfg.train_ratio)
+    safe_max = max(0, min(train_limit, val_ds.start_line - cfg.win_size))
+    sampler = BalancedSampler(
+        ds, target_ratio=cfg.target_ratio, seed=cfg.seed,
+        max_samples=cfg.max_samples, min_samples=cfg.min_samples,
+        max_oversample_factor=cfg.sampler_max_oversample,
+        min_minority_for_balance=cfg.sampler_min_minority,
+        valid_range=(0, safe_max),
+        use_oversampling=cfg.use_oversampling, cache_dir=None)
 
-    if cfg.quantization_config is not None:
-        for name in ("projector", "aggregator", "classifier", "time2vec"):
-            m = getattr(model, name, None)
-            if isinstance(m, nn.Module):
-                setattr(model, name, m.to(device))
-        if getattr(model, "use_cls", False):
-            model.cls_emb = nn.Parameter(model.cls_emb.data.to(device))
-    else:
-        model = model.to(device)
-        if cfg.model_dtype not in ("fp32", "tf32"):
-            model = model.to(resolve_dtype(cfg))
-    return model
+    print(f"\n{'='*90}\nDataloader test | train_ratio={cfg.train_ratio} | "
+          f"safe_max={safe_max} | sampler_total={len(sampler)}\n{'='*90}\n")
+
+    for idx in list(iter(sampler))[:n_windows]:
+        window, times, raws, label = ds[int(idx)]
+        print(f"--- start={idx} label={label} len={len(window)} ---")
+        for i, (w, t, _r) in enumerate(zip(window, times, raws)):
+            if i >= 5:
+                print(f"  ... ({len(window) - 5} more)")
+                break
+            print(f"  [{i:3d}] t={t}  {w!r}")
+        print()
 
 
-def _save_predictions(model, ds, train_loader, val_loader,
-                      cfg, device, line_cache, epoch: int, phase: str):
-    os.makedirs(cfg.predictions_dir, exist_ok=True)
+# ============================================================
+# Eval
+# ============================================================
 
-    print(f"[pred] collecting eval (phase={phase})...")
-    ev = collect_predictions(model, val_loader, device, line_cache, desc="pred eval")
-    eval_path = os.path.join(cfg.predictions_dir,
-                             f"pred_{cfg.run_tag}_eval.npz")
-    np.savez_compressed(
-        eval_path,
-        logits=ev["logits"], probs=ev["probs"],
-        bce=ev["bce"], labels=ev["labels"],
-        epoch=np.int32(epoch), phase=np.array(phase))
-    print(f"[pred] saved {eval_path} | n={len(ev['labels'])}, "
-          f"pos={int(ev['labels'].sum())}")
+@torch.no_grad()
+def evaluate(model, loader, device, max_windows=None):
+    from sklearn.metrics import precision_recall_fscore_support
+    model.eval()
+    probs, ys, n_seen = [], [], 0
+    for batch in loader:
+        if batch is None:
+            continue
+        logits = model(batch)
+        probs.append(torch.sigmoid(logits.float()).cpu())
+        ys.append(batch["labels"].cpu())
+        n_seen += ys[-1].numel()
+        if max_windows is not None and n_seen >= max_windows:
+            break
+    if not probs:
+        return {"f1": 0., "precision": 0., "recall": 0., "n": 0}
+    p = torch.cat(probs).numpy()
+    y = torch.cat(ys).numpy().astype(int)
+    pr, rc, f1, _ = precision_recall_fscore_support(
+        y, (p >= 0.5).astype(int), average="binary", zero_division=0)
+    return {"f1": float(f1), "precision": float(pr),
+            "recall": float(rc), "n": len(y)}
 
-    fs = train_loader.sampler
-    safe_min = getattr(fs, "min_start", 0)
-    safe_max = getattr(fs, "max_start", ds.total_lines)
-    train_sampler = RangeSampler(safe_min, safe_max, cfg.step_size)
 
-    collate = make_collate_fn(line_cache)
-    train_unique_loader = DataLoader(
-        ds, batch_size=cfg.batch_size, sampler=train_sampler,
-        collate_fn=collate, num_workers=cfg.num_workers)
-    print(f"[pred] collecting train on {len(train_sampler)} unique windows...")
-    tr = collect_predictions(model, train_unique_loader, device, line_cache,
-                             desc="pred train")
-    train_path = os.path.join(cfg.predictions_dir,
-                              f"pred_{cfg.run_tag}_train.npz")
-    starts = np.asarray(train_sampler.indices, dtype=np.int64)
-    np.savez_compressed(
-        train_path,
-        logits=tr["logits"], probs=tr["probs"],
-        bce=tr["bce"], labels=tr["labels"],
-        starts=starts, epoch=np.int32(epoch), phase=np.array(phase))
-    print(f"[pred] saved {train_path} | n={len(tr['labels'])}, "
-          f"pos={int(tr['labels'].sum())}")
+# ============================================================
+# Train one stage
+# ============================================================
+
+def train_one_stage(model, train_loader, val_loader, cfg, device,
+                    n_epochs: int, lr: float, stage_name: str,
+                    save_dir: str,
+                    start_epoch: int = 0, start_step: int = 0,
+                    optimizer_state=None, scheduler_state=None):
+    if n_epochs <= 0:
+        print(f"[{stage_name}] skip (n_epochs=0)")
+        return start_epoch, start_step
+
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    print(f"[{stage_name}] mode={_STAGE_MODE[stage_name]} "
+          f"trainable={sum(p.numel() for p in trainable):,}")
+
+    optimizer = torch.optim.AdamW(trainable, lr=lr,
+                                   weight_decay=cfg.weight_decay)
+    accum = max(1, cfg.grad_accum_steps)
+    steps_per_epoch = max(1, len(train_loader) // accum)
+    total_steps = steps_per_epoch * n_epochs
+    scheduler = _build_scheduler(optimizer, total_steps, cfg, max_lr=lr)
+
+    if optimizer_state is not None:
+        try:
+            optimizer.load_state_dict(optimizer_state)
+            print(f"[{stage_name}] optimizer state loaded")
+        except Exception as e:
+            print(f"[{stage_name}] optimizer state load failed: {e}")
+    if scheduler_state is not None:
+        try:
+            scheduler.load_state_dict(scheduler_state)
+            print(f"[{stage_name}] scheduler state loaded")
+        except Exception as e:
+            print(f"[{stage_name}] scheduler state load failed: {e}")
+
+    criterion = nn.BCEWithLogitsLoss()
+    global_step = start_step
+
+    for epoch_offset in range(n_epochs):
+        epoch = start_epoch + epoch_offset
+        model.train()
+        running, n_b, acc_count = 0.0, 0, 0
+        optimizer.zero_grad()
+        t0 = time.time()
+        pbar = tqdm.tqdm(train_loader, desc=f"{stage_name} e{epoch}")
+        for batch in pbar:
+            if batch is None:
+                continue
+            logits = model(batch)
+            loss = criterion(logits, batch["labels"].to(device))
+            if torch.isnan(loss) or torch.isinf(loss):
+                continue
+            (loss / accum).backward()
+            running += loss.item()
+            n_b += 1
+            acc_count += 1
+
+            if acc_count % accum == 0 or acc_count == len(train_loader):
+                if cfg.grad_clip:
+                    torch.nn.utils.clip_grad_norm_(trainable, cfg.grad_clip)
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
+                global_step += 1
+            pbar.set_postfix({"loss": f"{running / n_b:.4f}",
+                              "lr": f"{scheduler.get_last_lr()[0]:.2e}"})
+
+        m = evaluate(model, val_loader, device,
+                     max_windows=cfg.eval_max_windows)
+        print(f"[{stage_name} e{epoch}] loss={running/max(n_b,1):.4f} "
+              f"F1={m['f1']:.4f} P={m['precision']:.4f} "
+              f"R={m['recall']:.4f} n={m['n']} "
+              f"elapsed={time.time()-t0:.0f}s")
+
+    stage_dir = os.path.join(save_dir, stage_name)
+    model.save(stage_dir)
+    torch.save({
+        "stage": stage_name,
+        "epoch": start_epoch + n_epochs,
+        "global_step": global_step,
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict(),
+        "cfg": _cfg_for_save(cfg),
+    }, os.path.join(stage_dir, "train_state.pt"))
+    print(f"[save] {stage_dir}")
+
+    if cfg.push_to_hub and cfg.hub_repo_id:
+        from huggingface_hub import HfApi
+        HfApi().upload_folder(
+            folder_path=stage_dir, repo_id=cfg.hub_repo_id,
+            path_in_repo=f"{cfg.run_tag}/{stage_name}",
+            repo_type="model")
+        print(f"[hf] uploaded {stage_name} → {cfg.hub_repo_id}")
+
+    return start_epoch + n_epochs, global_step
 
 
 # ============================================================
@@ -754,316 +605,221 @@ def _save_predictions(model, ds, train_loader, val_loader,
 # ============================================================
 
 def run(cfg: Config):
-    random.seed(cfg.seed)
-    np.random.seed(cfg.seed)
-    torch.manual_seed(cfg.seed)
-    torch.cuda.manual_seed_all(cfg.seed)
+    random.seed(cfg.seed); np.random.seed(cfg.seed)
+    torch.manual_seed(cfg.seed); torch.cuda.manual_seed_all(cfg.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"[env] device={device}, cuda={torch.cuda.is_available()}")
+    print(f"[env] device={device}")
 
-    if cfg.push_to_hub:
-        ensure_login()
-        repo_id = resolve_repo_id(cfg)
-        ensure_repo(repo_id)
-        print(f"[hf] repo={repo_id}")
-    else:
-        repo_id = None
+    user_name = _login_hf(cfg)
+    template_repo = _resolve_template_repo(cfg, user_name)
+    print(f"[hf] user={user_name} template={template_repo}")
 
     if cfg.run_tag is None:
         ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-        cfg.run_tag = f"run_{ts}_{cfg.dataset}_tr{cfg.train_ratio}"
-    run_path_in_repo = f"runs/{cfg.run_tag}"
-    print(f"[run] tag={cfg.run_tag}")
+        cfg.run_tag = f"logllm_{cfg.dataset}_{cfg.encoder}_tr{cfg.train_ratio}_{ts}"
+    save_dir = os.path.join(cfg.save_dir, cfg.run_tag)
+    os.makedirs(save_dir, exist_ok=True)
+    print(f"[run] tag={cfg.run_tag} save_dir={save_dir}")
 
-    cache_root = cfg.cache_dir if cfg.use_cache else None
-    if cache_root:
-        os.makedirs(cache_root, exist_ok=True)
-
-    data_cls = _DATASET_CLS[cfg.dataset]
-    max_lines = math.inf if cfg.max_lines is None else cfg.max_lines
-    d = data_cls(
-        window_size=cfg.win_size, step_size=cfg.step_size,
-        max_lines=max_lines,
-        start_line=cfg.start_line, end_line=cfg.end_line,
-        use_in_colab=cfg.use_in_colab)
-    ds = SuperComputerDataset(d, cfg.anchor_step,
-                              train_ratio=cfg.eval_start_ratio,
-                              cache_dir=cache_root)
-    print(f"[data] total_lines={ds.total_lines}")
-
+    ds = _build_dataset(cfg)
     val_ds = EvaluationDataset(ds)
-    eval_start_line = val_ds.start_line
-    print(f"[data] eval_start_line={eval_start_line}")
+    print(f"[data] total_lines={ds.total_lines} val_start={val_ds.start_line}")
 
-    raw_encoder = load_jasper_encoder(
-        cfg.jasper_model_name, cfg.compression_ratio, device=str(device))
-    probe = raw_encoder(["probe"])
-    jasper_dim = probe.shape[-1]
-    del probe
-    print(f"[jasper] dim={jasper_dim}")
+    model = LogLLM(cfg, device)
+    collator = LogLLMCollator(model.encoder_tokenizer, cfg.max_content_len)
 
-    line_cache = LineEmbeddingCache(
-        raw_encoder, max_lines=cfg.cache_max_lines,
-        encode_batch=cfg.jasper_batch)
+    has_template = (cfg.use_shared_template
+                    and _template_exists(template_repo))
+    if has_template:
+        print(f"[template] FOUND at {template_repo} → load, skip stage1")
+        _load_llama_template(model, template_repo)
+    else:
+        print(f"[template] NOT FOUND → will train stage1 and push")
 
-    train_loader, base_sampler = _build_train_loader(
-        ds, eval_start_line, cfg, line_cache)
-    val_loader_small, val_loader_full = _build_loaders(
-        ds, val_ds, cfg, line_cache, base_sampler=base_sampler)
-
-    model = _build_model(cfg, jasper_dim, device)
-    n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    n_total = sum(p.numel() for p in model.parameters())
-    print(f"[opt] trainable={n_train:,} / total={n_total:,} "
-          f"({n_train / max(n_total, 1) * 100:.2f}%)")
-
-    start_epoch, global_step = 0, 0
-    ckpt_state = None
-
-    if cfg.resume_from_repo and cfg.resume_from_run_tag:
-        resume_path_in_repo = f"runs/{cfg.resume_from_run_tag}"
-        local_ckpt = "/content/ckpt_resume"
-        print(f"[resume] download {cfg.resume_from_repo}/{resume_path_in_repo}")
-        download_folder(cfg.resume_from_repo, resume_path_in_repo, local_ckpt)
-
-        train_state_dir = os.path.join(local_ckpt, resume_path_in_repo)
-        print(f"[resume] train_state_dir={train_state_dir}")
-        assert os.path.isdir(train_state_dir)
-
-        load_adapter_into(model, train_state_dir)
-        ckpt_state = torch.load(
-            os.path.join(train_state_dir, "train_state.pt"),
-            map_location="cpu")
-        if ckpt_state.get("head_state") is not None:
-            model.load_head_state_dict(ckpt_state["head_state"])
-        start_epoch = ckpt_state.get("epoch", 0)
-        global_step = ckpt_state.get("global_step", 0)
-        print(f"[resume] start_epoch={start_epoch} step={global_step}")
-
-    optimizer = torch.optim.AdamW(
-        [p for p in model.parameters() if p.requires_grad],
-        lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
-    total_steps = max(1, len(train_loader) * cfg.num_epochs)
-    scheduler = _build_scheduler(optimizer, total_steps, cfg)
-
-    if ckpt_state is not None:
+    if not has_template:
+        print(f"\n{'*' * 20} stage1 (llama) {'*' * 20}")
+        model.set_train_mode("llama")
+        tr, va = _build_loaders(cfg, ds, val_ds, collator,
+                                stage_idx=1, template_only=True)
+        train_one_stage(model, tr, va, cfg, device,
+                        n_epochs=cfg.n_epochs_stage1, lr=cfg.lr_stage1,
+                        stage_name="stage1", save_dir=save_dir)
         try:
-            optimizer.load_state_dict(ckpt_state["optimizer"])
-            print("[resume] optimizer state восстановлен")
+            _save_llama_template(model, template_repo)
         except Exception as e:
-            print(f"[resume] optimizer: {e}")
-        try:
-            scheduler.load_state_dict(ckpt_state["scheduler"])
-            print("[resume] scheduler state восстановлен")
-        except Exception as e:
-            print(f"[resume] scheduler: {e}")
+            print(f"[template] push failed: {e}")
 
-    criterion = torch.nn.BCEWithLogitsLoss()
+    for idx, name in zip([2, 3, 4], ["stage2", "stage3", "stage4"]):
+        print(f"\n{'*' * 20} {name} ({_STAGE_MODE[name]}) {'*' * 20}")
+        model.set_train_mode(_STAGE_MODE[name])
+        tr, va = _build_loaders(cfg, ds, val_ds, collator, stage_idx=idx)
+        train_one_stage(model, tr, va, cfg, device,
+                        n_epochs=getattr(cfg, f"n_epochs_{name}"),
+                        lr=getattr(cfg, f"lr_{name}"),
+                        stage_name=name, save_dir=save_dir)
 
-    local_metrics_path = f"/content/metrics_{cfg.run_tag}.pkl"
-    history: list = []
-    if repo_id:
-        try:
-            cached = hf_hub_download(
-                repo_id, f"{run_path_in_repo}/metrics.pkl")
-            with open(cached, "rb") as f:
-                history = pickle.load(f)
-            print(f"[metrics] загружено {len(history)} записей")
-        except Exception:
-            pass
-
-    def append_metric(record: dict):
-        history.append(record)
-        with open(local_metrics_path, "wb") as f:
-            pickle.dump(history, f)
-        if repo_id:
-            upload_file(local_metrics_path, repo_id,
-                        f"{run_path_in_repo}/metrics.pkl")
-
-    if repo_id:
-        with open("/content/config_run.json", "w") as f:
-            f.write(cfg_to_json(cfg))
-        upload_file("/content/config_run.json", repo_id,
-                    f"{run_path_in_repo}/config.json")
-
-    start_epoch, global_step = train_loop(
-        model, optimizer, scheduler, train_loader,
-        val_loader_small, val_loader_full, criterion, cfg, device,
-        line_cache, ds, append_metric, history,
-        start_epoch, global_step, repo_id)
-
-    local_final = f"/content/final_{cfg.run_tag}"
-    save_trainable(model, optimizer, scheduler, start_epoch,
-                   global_step, local_final)
-    if repo_id:
-        upload_folder(local_final, repo_id, f"{run_path_in_repo}/final")
-        upload_file(local_metrics_path, repo_id,
-                    f"{run_path_in_repo}/metrics.pkl")
-
-        merged = "/content/metrics_history.pkl"
-        merged_data = []
-        try:
-            cached = hf_hub_download(repo_id, "metrics_history.pkl")
-            with open(cached, "rb") as f:
-                merged_data = pickle.load(f)
-        except Exception:
-            pass
-
-        def _key(r):
-            return (r.get("run_tag"), r.get("global_step"),
-                    r.get("phase"))
-
-        seen = {_key(r) for r in merged_data}
-        new_records = [r for r in history if _key(r) not in seen]
-        merged_data.extend(new_records)
-        with open(merged, "wb") as f:
-            pickle.dump(merged_data, f)
-        upload_file(merged, repo_id, "metrics_history.pkl")
-        print(f"[hf] done -> https://huggingface.co/{repo_id}")
-
-    return {
-        "model": model, "optimizer": optimizer, "scheduler": scheduler,
-        "train_loader": train_loader,
-        "val_loader_small": val_loader_small,
-        "val_loader_full": val_loader_full,
-        "criterion": criterion,
-        "line_cache": line_cache, "history": history,
-        "append_metric": append_metric,
-        "global_step": global_step, "start_epoch": start_epoch,
-        "dataset": ds, "val_dataset": val_ds,
-        "eval_start_line": eval_start_line,
-        "train_ratio": cfg.train_ratio, "run_tag": cfg.run_tag,
-        "cfg": cfg, "device": device, "repo_id": repo_id,
-        "base_sampler": base_sampler,
-    }
+    print(f"\n[done] checkpoints → {save_dir}")
+    return {"model": model, "dataset": ds, "val_dataset": val_ds,
+            "cfg": cfg, "device": device, "save_dir": save_dir}
 
 
 # ============================================================
-# continue_training
+# run_many() — несколько конфигов подряд (sequential)
 # ============================================================
 
-def continue_training(state: dict, cfg: Config) -> dict:
-    if cfg.warmup_steps > 0:
-        print(f"[continue] warn: warmup_steps={cfg.warmup_steps} > 0.")
+def run_many(configs: typing.Sequence[Config]):
+    """Прогоняет run(cfg) для каждой конфигурации. Первый обучит template,
+    остальные его загрузят."""
+    results = {}
+    for i, cfg in enumerate(configs):
+        key = f"{cfg.dataset}__{cfg.encoder}"
+        print(f"\n\n{'#' * 30} [{i+1}/{len(configs)}] {key} {'#' * 30}\n")
+        results[key] = run(cfg)
+    return results
 
-    model = state["model"]
-    optimizer = state["optimizer"]
-    criterion = state["criterion"]
-    device = state["device"]
-    line_cache = state["line_cache"]
-    history = state["history"]
-    global_step = state["global_step"]
-    ds = state["dataset"]
-    val_ds = state["val_dataset"]
-    eval_start_line = state["eval_start_line"]
 
-    if cfg.push_to_hub:
-        repo_id = (cfg.hub_repo_id or state.get("repo_id")
-                   or resolve_repo_id(cfg))
+# ============================================================
+# continue_learning()
+# ============================================================
+
+def _download_from_hf(repo_id: str, subdir: str) -> str:
+    from huggingface_hub import snapshot_download
+    local = snapshot_download(repo_id=repo_id, repo_type="model",
+                               allow_patterns=[f"{subdir}/**"])
+    return os.path.join(local, subdir)
+
+
+def _resolve_resume_path(cfg: Config) -> str:
+    if cfg.resume_from is None:
+        raise ValueError("cfg.resume_from is None")
+    if cfg.resume_subdir:
+        return _download_from_hf(cfg.resume_from, cfg.resume_subdir)
+    if not os.path.isdir(cfg.resume_from):
+        raise FileNotFoundError(cfg.resume_from)
+    return cfg.resume_from
+
+
+def continue_learning(cfg: Config):
+    random.seed(cfg.seed); np.random.seed(cfg.seed)
+    torch.manual_seed(cfg.seed); torch.cuda.manual_seed_all(cfg.seed)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"[env] device={device}")
+    _login_hf(cfg)
+
+    resume_path = _resolve_resume_path(cfg)
+    resume_stage_dir = os.path.join(resume_path, cfg.resume_from_stage)
+    state_path = os.path.join(resume_stage_dir, "train_state.pt")
+    if not os.path.exists(state_path):
+        raise FileNotFoundError(state_path)
+    state = torch.load(state_path, map_location="cpu", weights_only=False)
+    print(f"[resume] {state_path} | epoch={state.get('epoch')} "
+          f"step={state.get('global_step')}")
+
+    if cfg.resume_next_stage:
+        idx = _STAGE_ORDER.index(cfg.resume_from_stage)
+        if idx + 1 >= len(_STAGE_ORDER):
+            print(f"[resume] last stage — nothing to do")
+            return None
+        target = _STAGE_ORDER[idx + 1]
+        start_epoch, start_step = 0, 0
+        optimizer_state = scheduler_state = None
+        print(f"[resume] {cfg.resume_from_stage} → {target} "
+              f"(fresh optimizer)")
     else:
-        repo_id = None
+        target = cfg.resume_from_stage
+        start_epoch = int(state.get("epoch", 0))
+        start_step = int(state.get("global_step", 0))
+        optimizer_state = state.get("optimizer")
+        scheduler_state = state.get("scheduler")
+        print(f"[resume] continue {target} from epoch={start_epoch} "
+              f"step={start_step}")
 
-    prev_train_limit = None
-    train_mode = getattr(cfg, "train_mode", "all")
+    n_epochs = (cfg.resume_n_epochs
+                if cfg.resume_n_epochs is not None
+                else getattr(cfg, f"n_epochs_{target}"))
+    lr = getattr(cfg, f"lr_{target}")
+    stage_idx = _STAGE_ORDER.index(target) + 1
 
-    if train_mode != "all" and cfg.train_ratio != state.get("train_ratio"):
-        prev_ratio = state.get("train_ratio", 0.0)
-        if prev_ratio > 0:
-            prev_train_limit = int(ds.total_lines * prev_ratio)
-            if train_mode == "mixed":
-                frac = getattr(cfg, "mixed_prev_fraction", 0.1)
-                prev_train_limit = int(prev_train_limit * (1.0 - frac))
-                print(f"[continue] train_mode=mixed, "
-                      f"prev_train_limit={prev_train_limit}")
-            else:
-                print(f"[continue] train_mode=new_only, "
-                      f"prev_train_limit={prev_train_limit}")
+    ds = _build_dataset(cfg)
+    val_ds = EvaluationDataset(ds)
 
-    base_sampler = state.get("base_sampler")
-    if cfg.train_ratio != state.get("train_ratio") \
-            or cfg.batch_size != state["cfg"].batch_size:
-        train_loader, base_sampler = _build_train_loader(
-            ds, eval_start_line, cfg, line_cache,
-            base_sampler=base_sampler,
-            prev_train_limit=prev_train_limit)
-        state["base_sampler"] = base_sampler
+    model = LogLLM(cfg, device)
+    model.load(resume_stage_dir)
+    collator = LogLLMCollator(model.encoder_tokenizer, cfg.max_content_len)
+
+    model.set_train_mode(_STAGE_MODE[target])
+    tr, va = _build_loaders(cfg, ds, val_ds, collator, stage_idx=stage_idx,
+                            template_only=(target == "stage1"))
+
+    if cfg.run_tag is None:
+        cfg.run_tag = f"continue_{target}_{_dt.datetime.now():%Y%m%d_%H%M%S}"
+    save_dir = os.path.join(cfg.save_dir, cfg.run_tag)
+    os.makedirs(save_dir, exist_ok=True)
+
+    print(f"\n{'*' * 20} {target} ({_STAGE_MODE[target]}) {'*' * 20}")
+    end_epoch, end_step = train_one_stage(
+        model, tr, va, cfg, device,
+        n_epochs=n_epochs, lr=lr, stage_name=target, save_dir=save_dir,
+        start_epoch=start_epoch, start_step=start_step,
+        optimizer_state=optimizer_state, scheduler_state=scheduler_state)
+    print(f"\n[done] epoch={end_epoch} step={end_step} "
+          f"checkpoints → {save_dir}")
+    return {"model": model, "dataset": ds, "val_dataset": val_ds,
+            "cfg": cfg, "device": device, "save_dir": save_dir}
+
+
+# ============================================================
+# CLI
+# ============================================================
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mode", default="train",
+                        choices=["train", "continue", "test_preproc",
+                                 "test_loader"])
+    parser.add_argument("--dataset", default="liberty",
+                        choices=list(_DATASET_CLS.keys()))
+    parser.add_argument("--encoder", default="bert-base",
+                        help=f"preset name or hf path. presets: {list(ENCODER_PRESETS)}")
+    parser.add_argument("--llama", default="meta-llama/Meta-Llama-3-8B")
+    parser.add_argument("--preprocess", default=None,
+                        choices=["none", "normalize", "replace", "both"])
+    parser.add_argument("--hf-token", default=None)
+    parser.add_argument("--template-repo", default=None)
+    parser.add_argument("--compute-dtype", default="bf16",
+                        choices=["bf16", "fp16", "fp32", "tf32"])
+    parser.add_argument("--n", type=int, default=10)
+    parser.add_argument("--resume-from", default=None)
+    parser.add_argument("--resume-subdir", default=None)
+    parser.add_argument("--resume-stage", default="stage4",
+                        choices=_STAGE_ORDER)
+    parser.add_argument("--resume-next", action="store_true")
+    parser.add_argument("--resume-epochs", type=int, default=None)
+    args = parser.parse_args()
+
+    cfg = Config(
+        dataset=args.dataset,
+        encoder=args.encoder,
+        llama_path=args.llama,
+        preprocess_mode=args.preprocess,
+        hf_token=args.hf_token,
+        template_repo_id=args.template_repo,
+        compute_dtype=args.compute_dtype,
+        resume_from=args.resume_from,
+        resume_subdir=args.resume_subdir,
+        resume_from_stage=args.resume_stage,
+        resume_next_stage=args.resume_next,
+        resume_n_epochs=args.resume_epochs,
+    )
+
+    if args.mode == "test_preproc":
+        test_preprocessing(cfg, n_samples=args.n)
+    elif args.mode == "test_loader":
+        test_dataloader(cfg, n_windows=args.n)
+    elif args.mode == "continue":
+        continue_learning(cfg)
     else:
-        train_loader = state["train_loader"]
-
-    if cfg.batch_size != state["cfg"].batch_size:
-        val_loader_small, val_loader_full = _build_loaders(
-            ds, val_ds, cfg, line_cache, base_sampler=base_sampler)
-    else:
-        val_loader_small = state["val_loader_small"]
-        val_loader_full = state["val_loader_full"]
-
-    total_steps = max(1, len(train_loader) * cfg.num_epochs)
-    scheduler = _build_scheduler(optimizer, total_steps, cfg)
-
-    local_metrics_path = f"/content/metrics_{cfg.run_tag}.pkl"
-
-    def append_metric(record: dict):
-        record["run_tag"] = cfg.run_tag
-        history.append(record)
-        with open(local_metrics_path, "wb") as f:
-            pickle.dump(history, f)
-        if repo_id:
-            upload_file(local_metrics_path, repo_id,
-                        f"runs/{cfg.run_tag}/metrics.pkl")
-
-    if repo_id:
-        with open("/content/config_run.json", "w") as f:
-            f.write(cfg_to_json(cfg))
-        upload_file("/content/config_run.json", repo_id,
-                    f"runs/{cfg.run_tag}/config.json")
-
-    start_epoch = state["start_epoch"]
-    start_epoch, global_step = train_loop(
-        model, optimizer, scheduler, train_loader,
-        val_loader_small, val_loader_full, criterion, cfg, device,
-        line_cache, ds, append_metric, history,
-        start_epoch, global_step, repo_id)
-
-    local_final = f"/content/final_{cfg.run_tag}"
-    save_trainable(model, optimizer, scheduler, start_epoch,
-                   global_step, local_final)
-    if repo_id:
-        upload_folder(local_final, repo_id, f"runs/{cfg.run_tag}/final")
-        upload_file(local_metrics_path, repo_id,
-                    f"runs/{cfg.run_tag}/metrics.pkl")
-
-        merged = "/content/metrics_history.pkl"
-        merged_data = []
-        try:
-            cached = hf_hub_download(repo_id, "metrics_history.pkl")
-            with open(cached, "rb") as f:
-                merged_data = pickle.load(f)
-        except Exception:
-            pass
-
-        def _key(r):
-            return (r.get("run_tag"), r.get("global_step"),
-                    r.get("phase"))
-
-        seen = {_key(r) for r in merged_data}
-        new_records = [r for r in history if _key(r) not in seen]
-        merged_data.extend(new_records)
-        with open(merged, "wb") as f:
-            pickle.dump(merged_data, f)
-        upload_file(merged, repo_id, "metrics_history.pkl")
-
-    state.update({
-        "cfg": cfg,
-        "train_loader": train_loader,
-        "val_loader_small": val_loader_small,
-        "val_loader_full": val_loader_full,
-        "scheduler": scheduler,
-        "run_tag": cfg.run_tag,
-        "train_ratio": cfg.train_ratio,
-        "start_epoch": start_epoch,
-        "global_step": global_step,
-        "append_metric": append_metric,
-        "repo_id": repo_id,
-    })
-    return state
+        run(cfg)

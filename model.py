@@ -1,40 +1,85 @@
 """
-Ядро: временные признаки, Jasper, кэш эмбеддингов, проектор, агрегатор,
-энкодер (Longformer + PEFT) + опциональная квантизация + FP8, метрики,
-save/load, сбор предсказаний.
+LogLLM: encoder-agnostic (BERT / RoBERTa / DeBERTa-v3 / Longformer / BigBird)
++ Llama 3.x QLoRA + LayerAggregator (last-K, masked pooling) + time fusion.
 """
 import os
 import math
 import typing
-import hashlib
-import contextlib
-import dataclasses
-import datetime as _dt
-from collections import OrderedDict
 
-import tqdm.auto as tqdm
-import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from transformers import (
-    LongformerModel, LongformerConfig, BitsAndBytesConfig,
+    AutoTokenizer, AutoConfig, AutoModel, AutoModelForCausalLM,
+    BitsAndBytesConfig,
 )
 from peft import (
-    LoraConfig, get_peft_model, PeftModel, TaskType,
-    PeftConfig,
+    LoraConfig, get_peft_model, prepare_model_for_kbit_training, TaskType,
 )
-from sentence_transformers import SentenceTransformer
-from sklearn.metrics import precision_recall_fscore_support
 
 
 # ============================================================
-# 1. Временные признаки
+# Encoder presets
+# ============================================================
+
+ENCODER_PRESETS: typing.Dict[str, dict] = {
+    "bert-base":            {"path": "bert-base-uncased",              "attention_window": None},
+    "bert-large":           {"path": "bert-large-uncased",             "attention_window": None},
+    "roberta-base":         {"path": "roberta-base",                   "attention_window": None},
+    "roberta-large":        {"path": "roberta-large",                  "attention_window": None},
+    "distilroberta-base":   {"path": "distilroberta-base",             "attention_window": None},
+    "deberta-v3-small":     {"path": "microsoft/deberta-v3-small",     "attention_window": None},
+    "deberta-v3-base":      {"path": "microsoft/deberta-v3-base",      "attention_window": None},
+    "deberta-v3-large":     {"path": "microsoft/deberta-v3-large",     "attention_window": None},
+    "longformer-base":      {"path": "allenai/longformer-base-4096",   "attention_window": 512},
+    "longformer-large":     {"path": "allenai/longformer-large-4096",  "attention_window": 512},
+    "bigbird-roberta-base": {"path": "google/bigbird-roberta-base",    "attention_window": 512},
+    "bigbird-roberta-large":{"path": "google/bigbird-roberta-large",   "attention_window": 512},
+}
+
+
+def resolve_encoder(encoder: str, overrides: typing.Optional[dict] = None) -> dict:
+    """Resolve preset name OR hf path → spec dict."""
+    spec = dict(ENCODER_PRESETS.get(encoder, {"path": encoder,
+                                              "attention_window": None}))
+    if overrides:
+        spec.update(overrides)
+    return spec
+
+
+def _auto_lora_targets(model) -> typing.List[str]:
+    names = {n for n, _ in model.named_modules()}
+    for cand in (("query", "value"),                # BERT/RoBERTa/Longformer/BigBird
+                 ("query_proj", "value_proj"),      # DeBERTa-v2/v3
+                 ("q_lin", "v_lin")):
+        if all(any(n.endswith(c) for n in names) for c in cand):
+            return list(cand)
+    print("[encoder] LoRA targets not auto-detected, fallback=('query','value')")
+    return ["query", "value"]
+
+
+def _is_longformer_like(cfg) -> bool:
+    return hasattr(cfg, "attention_window")
+
+
+_DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16,
+           "fp32": torch.float32, "tf32": torch.float32}
+
+
+def _resolve_dtype(name: str) -> torch.dtype:
+    if name not in _DTYPES:
+        raise ValueError(f"unknown dtype={name!r}; expected one of {list(_DTYPES)}")
+    if name == "tf32":
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+    return _DTYPES[name]
+
+
+# ============================================================
+# Time features
 # ============================================================
 
 class Time2Vec(nn.Module):
-    """t2v(t)[0] = w0·t + b0; t2v(t)[i] = sin(w_i·t + b_i)."""
     def __init__(self, k: int = 16):
         super().__init__()
         self.k = k
@@ -43,7 +88,7 @@ class Time2Vec(nn.Module):
         self.w = nn.Parameter(torch.randn(k) * 0.01)
         self.b = nn.Parameter(torch.zeros(k))
 
-    def forward(self, t: torch.Tensor) -> torch.Tensor:
+    def forward(self, t):
         if t.dim() == 2:
             t = t.squeeze(-1)
         lin = (self.w0 * t + self.b0).unsqueeze(-1)
@@ -51,727 +96,403 @@ class Time2Vec(nn.Module):
         return torch.cat([lin, per], dim=-1)
 
 
-def cyclic_time_features(times):
-    feats = []
-    for t in times:
-        if t is None:
-            feats.append([0.0] * 10)
-            continue
-        h, m = t.hour / 24.0, t.minute / 60.0
-        dow = t.weekday() / 7.0
-        mon = (t.month - 1) / 12.0
-        dom = (t.day - 1) / 31.0
-        feats.append([
-            math.sin(2 * math.pi * h), math.cos(2 * math.pi * h),
-            math.sin(2 * math.pi * m), math.cos(2 * math.pi * m),
-            math.sin(2 * math.pi * dow), math.cos(2 * math.pi * dow),
-            math.sin(2 * math.pi * mon), math.cos(2 * math.pi * mon),
-            math.sin(2 * math.pi * dom), math.cos(2 * math.pi * dom),
-        ])
-    return torch.tensor(feats, dtype=torch.float32)
-
-
-def time_delta_features(times):
-    deltas = []
+def _compute_deltas(times):
+    out = []
     for i, t in enumerate(times):
         if i == 0 or t is None or times[i - 1] is None:
-            deltas.append(0.0)
+            out.append(0.0)
         else:
-            deltas.append(float((t - times[i - 1]).total_seconds()))
-    return torch.tensor(deltas, dtype=torch.float32).unsqueeze(-1)
+            out.append(float((t - times[i - 1]).total_seconds()))
+    return torch.tensor(out, dtype=torch.float32)
 
 
-# ============================================================
-# 2. Jasper encoder (заморожен)
-# ============================================================
-
-def load_jasper_encoder(model_name: str, compression_ratio: float,
-                        device: str = "cuda"):
-    model = SentenceTransformer(
-        model_name,
-        trust_remote_code=True,
-        model_kwargs={"torch_dtype": torch.bfloat16},
-        device=device,
-    )
-    model.eval()
-    for p in model.parameters():
-        p.requires_grad_(False)
-
-    @torch.no_grad()
-    def encode(texts):
-        emb = model.encode(
-            texts,
-            compression_ratio=compression_ratio,
-            normalize_embeddings=True,
-            convert_to_tensor=True,
-        )
-        return emb.to(torch.bfloat16)
-
-    return encode
+def _cyclic_feats(times):
+    out = []
+    for t in times:
+        if t is None:
+            out.append([0.0] * 10); continue
+        h, m = t.hour / 24.0, t.minute / 60.0
+        dow, mon, dom = t.weekday() / 7.0, (t.month - 1) / 12.0, (t.day - 1) / 31.0
+        out.append([
+            math.sin(2*math.pi*h), math.cos(2*math.pi*h),
+            math.sin(2*math.pi*m), math.cos(2*math.pi*m),
+            math.sin(2*math.pi*dow), math.cos(2*math.pi*dow),
+            math.sin(2*math.pi*mon), math.cos(2*math.pi*mon),
+            math.sin(2*math.pi*dom), math.cos(2*math.pi*dom),
+        ])
+    return torch.tensor(out, dtype=torch.float32)
 
 
-# ============================================================
-# 3. LRU-кэш эмбеддингов строк
-# ============================================================
-
-class LineEmbeddingCache:
-    def __init__(self, encode_fn, max_lines: int = 50_000,
-                 encode_batch: int = 64):
-        self.encode_fn = encode_fn
-        self.max_lines = max_lines
-        self.encode_batch = encode_batch
-        self.cache: "OrderedDict[bytes, torch.Tensor]" = OrderedDict()
-        self.hits = 0
-        self.misses = 0
-
-    @staticmethod
-    def _key(line: str) -> bytes:
-        return hashlib.blake2b(line.encode("utf-8", "replace"),
-                               digest_size=16).digest()
-
-    @torch.no_grad()
-    def get_batch(self, lines):
-        n = len(lines)
-        out = [None] * n
-        miss_i, miss_lines = [], []
-
-        for i, line in enumerate(lines):
-            k = self._key(line)
-            emb = self.cache.get(k)
-            if emb is not None:
-                self.cache.move_to_end(k)
-                out[i] = emb
-                self.hits += 1
-            else:
-                miss_i.append(i)
-                miss_lines.append(line)
-
-        if miss_lines:
-            self.misses += len(miss_lines)
-            new_embs = []
-            for j in range(0, len(miss_lines), self.encode_batch):
-                chunk = miss_lines[j:j + self.encode_batch]
-                emb = self.encode_fn(chunk)
-                new_embs.append(emb.detach().to("cpu"))
-            new_embs = torch.cat(new_embs, dim=0)
-            for j, i in enumerate(miss_i):
-                k = self._key(miss_lines[j])
-                out[i] = new_embs[j]
-                self.cache[k] = new_embs[j]
-                self.cache.move_to_end(k)
-            overflow = len(self.cache) - self.max_lines
-            for _ in range(max(0, overflow)):
-                self.cache.popitem(last=False)
-
-        return torch.stack(out, dim=0)
-
-    def stats(self) -> str:
-        t = self.hits + self.misses
-        hr = self.hits / t * 100 if t else 0.0
-        return (f"cache size={len(self.cache)}/{self.max_lines} "
-                f"hits={self.hits} misses={self.misses} hit_rate={hr:.1f}%")
-
-def make_raw_collate_fn():
-    """
-    Просто возвращает список кортежей от Dataset. Никакого Jasper,
-    никаких тензоров — это выполняется в воркерах DataLoader.
-    """
-    def collate(batch):
-        return list(batch)   # [(window, times, raws, label), ...]
-    return collate
-
-def make_collate_fn(cache: LineEmbeddingCache):
-    def collate(batch):
-        windows, times_list, labels = [], [], []
-        for window, window_times, _raws, label in batch:
-            if not window:
-                continue
-            emb = cache.get_batch(window)
-            windows.append(emb)
-            times_list.append(window_times)
-            labels.append(float(label))
-
-        if not windows:
-            return None
-        max_len = max(e.shape[0] for e in windows)
-        D = windows[0].shape[1]
-        padded = torch.zeros(len(windows), max_len, D, dtype=torch.bfloat16)
-        mask = torch.zeros(len(windows), max_len, dtype=torch.long)
-        for i, e in enumerate(windows):
-            n = e.shape[0]
-            padded[i, :n] = e
-            mask[i, :n] = 1
-
-        return {
-            "log_embs": padded,
-            "attention_mask": mask,
-            "times": times_list,
-            "labels": torch.tensor(labels, dtype=torch.float32),
-        }
-    return collate
-
-def pack_batch(batch, cache: "LineEmbeddingCache", device):
-    """
-    Выполняется в главном процессе.
-    batch: list[(window, times, raws, label)]
-    Возвращает dict с тензорами на device или None.
-    """
-    windows, times_list, labels = [], [], []
-    for window, window_times, _raws, label in batch:
-        if not window:
-            continue
-        windows.append(window)
-        times_list.append(window_times)
-        labels.append(float(label))
-
-    if not windows:
-        return None
-
-    # Один вызов Jasper — сразу на все окна батча
-    all_lines = [line for w in windows for line in w]
-    all_embs = cache.get_batch(all_lines)            # [Σ, D] CPU bf16
-
-    # Разбить обратно по окнам
-    window_embs = []
-    idx = 0
-    for w in windows:
-        n = len(w)
-        window_embs.append(all_embs[idx:idx + n])
-        idx += n
-
-    max_len = max(e.shape[0] for e in window_embs)
-    D = window_embs[0].shape[1]
-    padded = torch.zeros(len(window_embs), max_len, D, dtype=torch.bfloat16)
-    mask = torch.zeros(len(window_embs), max_len, dtype=torch.long)
-    for i, e in enumerate(window_embs):
-        n = e.shape[0]
-        padded[i, :n] = e
-        mask[i, :n] = 1
-
-    return {
-        "log_embs": padded,
-        "attention_mask": mask,
-        "times": times_list,
-        "labels": torch.tensor(labels, dtype=torch.float32),
-    }
-# ============================================================
-# 4. Проектор Jasper -> Longformer
-# ============================================================
-
-class LogProjector(nn.Module):
-    def __init__(self, in_dim: int, out_dim: int, hidden_mult: int = 2):
+class TimeFeatureEncoder(nn.Module):
+    def __init__(self, out_dim: int, emb_len: int = 16,
+                 use_cyclic: bool = True, use_delta: bool = True,
+                 dtype: torch.dtype = torch.bfloat16):
         super().__init__()
-        hidden = out_dim * hidden_mult
-        self.net = nn.Sequential(
-            nn.LayerNorm(in_dim),
-            nn.Linear(in_dim, hidden),
-            nn.GELU(),
-            nn.Linear(hidden, out_dim),
-        )
-        nn.init.zeros_(self.net[-1].weight)
-        nn.init.zeros_(self.net[-1].bias)
-        self.residual = nn.Identity() if in_dim == out_dim \
-                        else nn.Linear(in_dim, out_dim, bias=False)
+        self.use_delta, self.use_cyclic = use_delta, use_cyclic
+        self.out_dtype = dtype
+        self.t2v = Time2Vec(emb_len) if use_delta else None
+        in_dim = ((emb_len + 1) if use_delta else 0) + (10 if use_cyclic else 0)
+        self.proj = nn.Linear(in_dim, out_dim) if in_dim > 0 else None
 
-    def forward(self, x):
-        return self.residual(x) + self.net(x)
+    def _in_dim(self):
+        return ((self.t2v.k + 1) if self.use_delta else 0) \
+               + (10 if self.use_cyclic else 0)
+
+    def forward(self, times_list):
+        B = len(times_list)
+        Ls = [len(t) for t in times_list]
+        L_max = max(Ls) if Ls else 1
+        params = list(self.parameters())
+        device = params[0].device if params else torch.device("cpu")
+        feats = torch.zeros(B, L_max, self._in_dim(), device=device)
+        for b, t_list in enumerate(times_list):
+            L = len(t_list); parts = []
+            if self.use_delta:
+                parts.append(self.t2v(_compute_deltas(t_list).to(device)))
+            if self.use_cyclic:
+                parts.append(_cyclic_feats(t_list).to(device))
+            if parts:
+                feats[b, :L] = torch.cat(parts, dim=-1)
+        if self.proj is not None:
+            feats = self.proj(feats)
+        return feats.to(self.out_dtype)
+
+
+class CrossAttentionFusion(nn.Module):
+    """Time queries → log keys/values. No causal mask (classification)."""
+    def __init__(self, dim: int, num_heads: int = 8, dropout: float = 0.1):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(dim, num_heads, dropout=dropout,
+                                           batch_first=True)
+        self.norm = nn.LayerNorm(dim)
+        nn.init.zeros_(self.attn.out_proj.weight)
+        nn.init.zeros_(self.attn.out_proj.bias)
+
+    def forward(self, time_emb, log_emb, log_mask=None):
+        kpm = (log_mask == 0) if log_mask is not None else None
+        out, _ = self.attn(time_emb, log_emb, log_emb, key_padding_mask=kpm)
+        return self.norm(time_emb + out)
 
 
 # ============================================================
-# 5. Агрегатор
+# LayerAggregator — как в LogAnomalyModel
 # ============================================================
 
 class LayerAggregator(nn.Module):
-    def __init__(self, hidden: int, k: int = 4, mode: str = "weighted"):
+    def __init__(self, hidden: int, k: int = 1, mode: str = "weighted",
+                 pooling: str = "mean"):
         super().__init__()
         self.k = k
         self.mode = mode
+        self.pooling = pooling
         if mode == "weighted":
             self.layer_weights = nn.Parameter(torch.zeros(k))
         elif mode == "attn_pool":
             self.pool_q = nn.Parameter(torch.randn(hidden) * 0.02)
+        elif mode not in ("last", "mean"):
+            raise ValueError(f"unknown layer agg mode={mode!r}")
+        if pooling not in ("cls", "mean", "max"):
+            raise ValueError(f"unknown pooling={pooling!r}")
 
     def forward(self, hidden_states, attention_mask):
-        hs = torch.stack(hidden_states[-self.k:], dim=0)
-        if self.mode == "mean":
-            h = hs.mean(dim=0)
-        elif self.mode == "weighted":
-            w = torch.softmax(self.layer_weights, dim=0)
-            h = (hs * w.view(-1, 1, 1, 1)).sum(dim=0)
-        elif self.mode == "last":
-            h = hs[-1]
-        else:
-            h = hs.mean(dim=0)
+        hs = torch.stack(hidden_states[-self.k:], dim=0)   # [K,B,L,D]
 
         if self.mode == "attn_pool":
+            h = hs.mean(dim=0)
             score = (h @ self.pool_q) / math.sqrt(h.shape[-1])
             score = score.masked_fill(attention_mask == 0, -1e4)
             alpha = torch.softmax(score, dim=1)
             return (h * alpha.unsqueeze(-1)).sum(dim=1)
 
-        m = attention_mask.unsqueeze(-1).to(h.dtype)
-        return (h * m).sum(dim=1) / m.sum(dim=1).clamp_min(1.0)
+        if self.mode == "last":
+            h = hs[-1]
+        elif self.mode == "mean":
+            h = hs.mean(dim=0)
+        else:  # weighted
+            w = torch.softmax(self.layer_weights, dim=0)
+            h = (hs * w.view(-1, 1, 1, 1)).sum(dim=0)
+
+        if self.pooling == "cls":
+            return h[:, 0, :]
+        if self.pooling == "mean":
+            m = attention_mask.unsqueeze(-1).to(h.dtype)
+            return (h * m).sum(dim=1) / m.sum(dim=1).clamp_min(1.0)
+        # max
+        m = attention_mask.unsqueeze(-1).bool()
+        return h.masked_fill(~m, -1e9).max(dim=1).values
 
 
 # ============================================================
-# 6. Dtype / TF32 / FP8 / квантизация
+# LogLLM
 # ============================================================
 
-_DTYPE_MAP = {
-    "bf16": torch.bfloat16,
-    "fp16": torch.float16,
-    "fp32": torch.float32,
-    "tf32": torch.float32,
-}
-
-
-def resolve_dtype(cfg) -> torch.dtype:
-    return _DTYPE_MAP[cfg.model_dtype]
-
-
-def _enable_tf32_if_needed(cfg):
-    if cfg.model_dtype == "tf32":
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        print("[dtype] tf32 enabled for matmul/cudnn")
-    else:
-        torch.backends.cuda.matmul.allow_tf32 = False
-        torch.backends.cudnn.allow_tf32 = False
-
-
-def _apply_fp8(model, cfg):
-    backend = cfg.fp8_backend.lower()
-    if backend == "torchao":
-        try:
-            from torchao.float8 import (convert_to_float8_training,
-                                        Float8LinearConfig)
-        except Exception as e:
-            raise RuntimeError(
-                f"torchao FP8 недоступен: {e}. pip install torchao")
-        try:
-            f8_cfg = Float8LinearConfig.from_recipe_name(cfg.fp8_recipe)
-        except Exception:
-            f8_cfg = Float8LinearConfig.from_recipe_name("rowwise")
-        convert_to_float8_training(model, config=f8_cfg)
-        print(f"[fp8] torchao recipe={cfg.fp8_recipe} applied")
-        return model
-    if backend == "transformer_engine":
-        print("[fp8] transformer_engine selected (managed by accelerate)")
-        return model
-    raise ValueError(f"unknown fp8_backend={backend}")
-
-
-# ============================================================
-# 7. EncoderSpec + фабрика
-# ============================================================
-
-@dataclasses.dataclass
-class EncoderSpec:
-    module: nn.Module
-    hidden_size: int
-    num_layers: int
-    supports_global_attn: bool = False
-    pads_hidden_states: bool = False
-    returns_all_hidden_states: bool = True
-    is_peft: bool = False
-
-
-def _resolve_peft_config(cfg) -> PeftConfig:
-    if getattr(cfg, "peft_config", None) is None:
-        raise ValueError(
-            "cfg.peft_config is None.\n"
-            "Pass a PeftConfig explicitly, e.g.:\n"
-            "    from peft import LoraConfig, TaskType\n"
-            "    cfg = Config(..., peft_config=LoraConfig(\n"
-            "        task_type=TaskType.FEATURE_EXTRACTION,\n"
-            "        r=32, lora_alpha=32, lora_dropout=0.1,\n"
-            "        target_modules=['query','key','value','dense']))"
-        )
-    pc = cfg.peft_config
-    if isinstance(pc, LoraConfig) and getattr(pc, "target_modules", None) is None:
-        print("[peft] WARN: LoraConfig без target_modules — "
-              "укажите явно для Longformer.")
-    print(f"[peft] {type(pc).__name__} | task={pc.task_type}")
-    return pc
-
-
-def _build_longformer_encoder(cfg, device: torch.device) -> EncoderSpec:
-    _enable_tf32_if_needed(cfg)
-
-    lf_cfg = LongformerConfig.from_pretrained(cfg.longformer_model_name)
-    lf_cfg.num_hidden_layers = cfg.longformer_layers
-    lf_cfg.attention_window = [cfg.longformer_attention_window] \
-        * cfg.longformer_layers
-
-    kwargs = dict(config=lf_cfg)
-
-    if cfg.quantization_config is not None:
-        if cfg.fp8_training:
-            raise ValueError(
-                "quantization_config и fp8_training несовместимы.")
-        kwargs["quantization_config"] = cfg.quantization_config
-        kwargs["device_map"] = {
-            "": device.index if device.index is not None else 0}
-        print(f"[encoder] bnb quant enabled")
-    else:
-        kwargs["torch_dtype"] = resolve_dtype(cfg)
-        print(f"[encoder] dtype={cfg.model_dtype}")
-
-    base = LongformerModel.from_pretrained(cfg.longformer_model_name, **kwargs)
-    if cfg.quantization_config is None:
-        base = base.to(device)
-
-    if cfg.fp8_training:
-        base = _apply_fp8(base, cfg)
-
-    peft_cfg = _resolve_peft_config(cfg)
-    peft_model = get_peft_model(base, peft_cfg)
-
-    return EncoderSpec(
-        module=peft_model,
-        hidden_size=lf_cfg.hidden_size,
-        num_layers=lf_cfg.num_hidden_layers,
-        supports_global_attn=True,
-        pads_hidden_states=True,
-        returns_all_hidden_states=True,
-        is_peft=True,
-    )
-
-
-_ENCODER_BUILDERS = {
-    "longformer": _build_longformer_encoder,
-}
-
-
-def build_encoder(cfg, device: torch.device) -> EncoderSpec:
-    if getattr(cfg, "encoder_factory", None) is not None:
-        print("[encoder] using custom encoder_factory")
-        spec = cfg.encoder_factory(cfg, device)
-        assert isinstance(spec, EncoderSpec)
-        return spec
-    etype = getattr(cfg, "encoder_type", "longformer")
-    if etype not in _ENCODER_BUILDERS:
-        raise ValueError(
-            f"Unknown encoder_type '{etype}'. "
-            f"Available: {list(_ENCODER_BUILDERS.keys())}")
-    return _ENCODER_BUILDERS[etype](cfg, device)
-
-
-# ============================================================
-# 8. Основная модель
-# ============================================================
-
-class LogAnomalyModel(nn.Module):
-    def __init__(self, cfg, jasper_dim: int, device: torch.device):
+class LogLLM(nn.Module):
+    def __init__(self, config, device):
         super().__init__()
-        self.cfg = cfg
+        self.cfg = config
+        self.device = device
+        self.compute_dtype = _resolve_dtype(config.compute_dtype)
 
-        self.spec = build_encoder(cfg, device)
-        self.encoder = self.spec.module
-        self.longformer = self.encoder
+        # ---------- Encoder ----------
+        enc_spec = resolve_encoder(config.encoder, config.encoder_overrides)
+        self.encoder_spec = enc_spec
+        self.encoder_tokenizer = AutoTokenizer.from_pretrained(enc_spec["path"])
 
-        lf_hidden = self.spec.hidden_size
-        self.lf_hidden = lf_hidden
-
-        self.projector = LogProjector(jasper_dim, lf_hidden)
-        self.aggregator = LayerAggregator(
-            lf_hidden, k=cfg.aggregate_layers, mode=cfg.aggregate_mode)
-        self.time2vec = Time2Vec(cfg.time_emb_len) if cfg.use_time2vec else None
-
-        self.use_cls = cfg.use_learned_cls
-        if self.use_cls:
-            self.cls_emb = nn.Parameter(
-                torch.randn(1, 1, lf_hidden) * 0.02)
-
-        time_dim = (cfg.time_emb_len + 1) if cfg.use_time2vec else 0
-        cyclic_dim = 10 if cfg.use_cyclic_time else 0
-        has_time_dim = 1 if getattr(cfg, "use_time_present", False) else 0
-        head_dim = lf_hidden + time_dim + cyclic_dim + 1 + has_time_dim
-
-        self.classifier = nn.Sequential(
-            nn.Linear(head_dim, 256),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(256, 1),
-        )
-
-    def trainable_parameters(self):
-        head_names = {"projector", "aggregator", "time2vec",
-                      "classifier", "cls_emb"}
-        for name, p in self.named_parameters():
-            root = name.split(".")[0]
-            if root in head_names and p.requires_grad:
-                yield name, p
-
-    def head_state_dict(self) -> dict:
-        return {name: p.detach().cpu()
-                for name, p in self.trainable_parameters()}
-
-    def load_head_state_dict(self, sd: dict):
-        own = dict(self.named_parameters())
-        for name, tensor in sd.items():
-            if name not in own:
-                print(f"[load_head] пропущено: {name}")
-                continue
-            if own[name].shape != tensor.shape:
-                raise RuntimeError(
-                    f"[load_head] shape mismatch {name}: "
-                    f"ckpt {tuple(tensor.shape)} vs "
-                    f"model {tuple(own[name].shape)}")
-            own[name].data.copy_(tensor.to(own[name].device,
-                                            dtype=own[name].dtype))
-
-    def forward(self, log_embs, times, attention_mask):
-        target_dtype = next(self.projector.parameters()).dtype
-        log_embs = log_embs.to(target_dtype)
-
-        x = self.projector(log_embs)
-        B, L, _ = x.shape
-
-        if self.use_cls:
-            cls = self.cls_emb.expand(B, -1, -1).to(x.dtype)
-            x = torch.cat([cls, x], dim=1)
-            ones = torch.ones(B, 1, dtype=attention_mask.dtype,
-                              device=x.device)
-            attention_mask = torch.cat([ones, attention_mask], dim=1)
-
-        original_len = attention_mask.shape[1]
-
-        fwd_kwargs = dict(inputs_embeds=x, attention_mask=attention_mask)
-        if self.spec.returns_all_hidden_states:
-            fwd_kwargs["output_hidden_states"] = True
-        if self.spec.supports_global_attn:
-            global_attn = torch.zeros_like(attention_mask)
-            if self.use_cls:
-                global_attn[:, 0] = 1
-            fwd_kwargs["global_attention_mask"] = global_attn
-
-        out = self.encoder(**fwd_kwargs)
-
-        if self.spec.returns_all_hidden_states:
-            hidden = out.hidden_states
-        else:
-            hidden = (out.last_hidden_state,)
-
-        if self.spec.pads_hidden_states:
-            hidden = tuple(h[:, :original_len, :] for h in hidden)
-
-        K = self.aggregator.k
-        if self.use_cls:
-            hs = torch.stack([h[:, 0] for h in hidden[-K:]], dim=0)
-            if self.aggregator.mode == "weighted":
-                w = torch.softmax(self.aggregator.layer_weights, dim=0)
-                pooled = (hs * w.view(-1, 1, 1)).sum(dim=0)
+        enc_cfg = AutoConfig.from_pretrained(enc_spec["path"])
+        if enc_spec["attention_window"] and _is_longformer_like(enc_cfg):
+            win = int(enc_spec["attention_window"])
+            if isinstance(enc_cfg.attention_window, int):
+                enc_cfg.attention_window = [win] * enc_cfg.num_hidden_layers
             else:
-                pooled = hs.mean(dim=0)
+                enc_cfg.attention_window = [win] * len(enc_cfg.attention_window)
+
+        if config.encoder_quantize:
+            enc_bnb = BitsAndBytesConfig(
+                load_in_4bit=True, bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=self.compute_dtype,
+                bnb_4bit_use_double_quant=True)
+            self.encoder = AutoModel.from_pretrained(
+                enc_spec["path"], config=enc_cfg,
+                quantization_config=enc_bnb,
+                low_cpu_mem_usage=True, device_map=device)
+            self.encoder = prepare_model_for_kbit_training(self.encoder)
         else:
-            pooled = self.aggregator(hidden, attention_mask)
+            self.encoder = AutoModel.from_pretrained(
+                enc_spec["path"], config=enc_cfg,
+                torch_dtype=self.compute_dtype,
+                low_cpu_mem_usage=True).to(device)
 
-        time_feats = []
-        for b in range(B):
-            t_list = times[b]
-            delta = time_delta_features(t_list).to(pooled.device,
-                                                    pooled.dtype)
-            parts = []
-            if self.time2vec is not None:
-                t2v = self.time2vec(delta.squeeze(-1))
-                parts.append(t2v.mean(dim=0))
-            if self.cfg.use_cyclic_time:
-                cyc = cyclic_time_features(t_list).to(pooled.device,
-                                                       pooled.dtype)
-                parts.append(cyc.mean(dim=0))
-            parts.append(delta.mean(dim=0))
-            if getattr(self.cfg, "use_time_present", False):
-                has_time = torch.tensor(
-                    [1.0 if t is not None else 0.0 for t in t_list],
-                    device=pooled.device, dtype=pooled.dtype,
-                ).mean().unsqueeze(0)
-                parts.append(has_time)
-            time_feats.append(torch.cat(parts))
+        self.encoder_dim = self.encoder.config.hidden_size
+        self._longformer_like = _is_longformer_like(self.encoder.config)
 
-        time_feats = torch.stack(time_feats)
-        combined = torch.cat([pooled, time_feats], dim=-1)
-        return self.classifier(combined).squeeze(-1)
+        # ---------- Aggregator ----------
+        self.encoder_last_layers = int(config.encoder_last_layers)
+        self.encoder_layer_agg = config.encoder_layer_agg
+        self.encoder_pooling = config.encoder_pooling
+        self.aggregator = LayerAggregator(
+            hidden=self.encoder_dim,
+            k=self.encoder_last_layers,
+            mode=self.encoder_layer_agg,
+            pooling=self.encoder_pooling,
+        ).to(device)
 
+        # ---------- Encoder LoRA ----------
+        lora_targets = (config.encoder_lora_targets
+                        or _auto_lora_targets(self.encoder))
+        print(f"[encoder] {enc_spec['path']} | dim={self.encoder_dim} | "
+              f"K={self.encoder_last_layers} agg={self.encoder_layer_agg} "
+              f"pool={self.encoder_pooling} | lora={lora_targets}")
+        self.encoder = get_peft_model(self.encoder, LoraConfig(
+            task_type=TaskType.FEATURE_EXTRACTION,
+            r=config.encoder_lora_r, lora_alpha=config.encoder_lora_alpha,
+            lora_dropout=0.01, target_modules=lora_targets))
 
-# ============================================================
-# 9. Метрики
-# ============================================================
+        # ---------- Llama QLoRA ----------
+        llama_bnb = BitsAndBytesConfig(
+            load_in_4bit=True, bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=self.compute_dtype)
+        self.llama_tokenizer = AutoTokenizer.from_pretrained(
+            config.llama_path, padding_side="right")
+        self.llama_tokenizer.pad_token = self.llama_tokenizer.eos_token
+        self.llama = AutoModelForCausalLM.from_pretrained(
+            config.llama_path, quantization_config=llama_bnb,
+            low_cpu_mem_usage=True, device_map=device)
+        self.llama = prepare_model_for_kbit_training(self.llama)
+        self.llama = get_peft_model(self.llama, LoraConfig(
+            r=config.llama_lora_r, lora_alpha=config.llama_lora_alpha,
+            lora_dropout=0.1,
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+            bias="none", task_type=TaskType.CAUSAL_LM))
+        self.llama_dim = self.llama.config.hidden_size
 
-@torch.no_grad()
-def evaluate(model, loader, device, criterion, line_cache,
-             max_windows=None, max_batches=None, desc="eval") -> dict:
-    model.eval()
-    losses, probs, ys = [], [], []
-    n_seen = 0
+        # ---------- Projector ----------
+        self.projector = nn.Linear(self.encoder_dim, self.llama_dim).to(device)
 
-    pbar = tqdm.tqdm(loader, desc=desc, leave=False)
-    for step, raw_batch in enumerate(pbar):
-        if max_batches is not None and step >= max_batches:
-            break
+        # ---------- Time fusion ----------
+        self.use_time = config.use_time_features
+        self.fusion_type = config.fusion_type if self.use_time else "none"
+        if self.use_time and self.fusion_type in ("cross_attention", "concat"):
+            self.time_encoder = TimeFeatureEncoder(
+                out_dim=self.llama_dim, emb_len=config.time_emb_len,
+                use_cyclic=config.use_cyclic_time,
+                use_delta=config.use_time2vec,
+                dtype=self.compute_dtype).to(device)
+            if self.fusion_type == "cross_attention":
+                self.cross_attn = CrossAttentionFusion(self.llama_dim).to(device)
+            elif self.fusion_type == "concat":
+                self.concat_proj = nn.Linear(2 * self.llama_dim,
+                                              self.llama_dim).to(device)
 
-        batch = pack_batch(raw_batch, line_cache, device)
-        if batch is None:
-            continue
+        # ---------- Head ----------
+        self.classifier = nn.Sequential(
+            nn.Linear(self.llama_dim, 256),
+            nn.ReLU(), nn.Dropout(0.2), nn.Linear(256, 1),
+        ).to(device)
 
-        log_embs = batch["log_embs"].to(device)
-        mask = batch["attention_mask"].to(device)
-        y = batch["labels"].to(device)
+        self.ins1_str = "Below is a sequence of system log messages:"
+        self.ins2_str = ". Is this sequence normal or anomalous?"
 
-        logits = model(log_embs, batch["times"], mask)
-        lv = criterion(logits.float(), y).item()
-        if not np.isnan(lv) and not np.isinf(lv):
-            losses.append(lv)
+    # ---------- Encode ----------
+    def _encode_logs(self, enc_inputs, seq_positions):
+        need_hs = self.encoder_last_layers > 1
+        out = self.encoder(**enc_inputs, output_hidden_states=need_hs)
+        hidden = out.hidden_states if need_hs else (out.last_hidden_state,)
+        pooled = self.aggregator(hidden, enc_inputs["attention_mask"])
+        proj = self.projector(pooled.float()).to(self.compute_dtype)
+        return list(torch.tensor_split(proj, seq_positions)) if seq_positions else [proj]
 
-        probs.append(torch.sigmoid(logits.float()).cpu())
-        ys.append(y.cpu())
-        n_seen += y.numel()
+    def _apply_fusion(self, window_embs, times_list):
+        if not self.use_time or self.fusion_type in ("projector", "none"):
+            return window_embs
 
-        pbar.set_postfix({"seen": n_seen})
-        if max_windows is not None and n_seen >= max_windows:
-            break
+        B = len(window_embs)
+        Ls = [e.shape[0] for e in window_embs]
+        L_max = max(Ls) if Ls else 1
+        D = window_embs[0].shape[1]
+        padded = torch.zeros(B, L_max, D, dtype=self.compute_dtype, device=self.device)
+        mask = torch.zeros(B, L_max, dtype=torch.long, device=self.device)
+        for b, e in enumerate(window_embs):
+            n = e.shape[0]
+            padded[b, :n] = e
+            mask[b, :n] = 1
 
-    if not probs:
-        return {"loss": 0.0, "precision": 0.0, "recall": 0.0, "f1": 0.0,
-                "n_windows": 0, "n_pos": 0}
+        time_emb = self.time_encoder(times_list).to(self.compute_dtype)
+        if self.fusion_type == "cross_attention":
+            fused = self.cross_attn(time_emb, padded, log_mask=mask)
+        elif self.fusion_type == "concat":
+            fused = self.concat_proj(torch.cat([padded, time_emb], dim=-1))
+        else:
+            fused = padded
+        return [fused[b, :Ls[b]] for b in range(B)]
 
-    p_prob = torch.cat(probs).numpy()
-    y_true = torch.cat(ys).numpy().astype(int)
+    # ---------- Forward ----------
+    def forward(self, batch):
+        enc_inputs = {k: v.to(self.device)
+                      for k, v in batch["bert_inputs"].items()}
 
-    valid = ~np.isnan(p_prob)
-    if valid.sum() == 0:
-        return {"loss": 0.0, "precision": 0.0, "recall": 0.0, "f1": 0.0,
-                "n_windows": 0, "n_pos": 0}
-    p_prob = p_prob[valid]
-    y_true = y_true[valid]
-    y_pred = (p_prob >= 0.5).astype(int)
+        if self._longformer_like:
+            g = torch.zeros_like(enc_inputs["attention_mask"])
+            g[:, 0] = 1
+            enc_inputs["global_attention_mask"] = g
 
-    pr, rc, f1, _ = precision_recall_fscore_support(
-        y_true, y_pred, average="binary", zero_division=0)
+        seq_positions = batch["seq_positions"].tolist()
+        times_list = batch["times"]
+        B = len(times_list)
 
-    return {
-        "loss": float(np.mean(losses)) if losses else float("nan"),
-        "precision": float(pr),
-        "recall": float(rc),
-        "f1": float(f1),
-        "n_windows": int(len(y_true)),
-        "n_pos": int(y_true.sum()),
-    }
+        window_embs = self._encode_logs(enc_inputs, seq_positions)
+        window_embs = self._apply_fusion(window_embs, times_list)
 
+        embed = self.llama.get_input_embeddings()
+        ins1 = embed(self.llama_tokenizer(
+            self.ins1_str, return_tensors="pt",
+            add_special_tokens=False)["input_ids"][0].to(self.device))
+        ins2 = embed(self.llama_tokenizer(
+            self.ins2_str, return_tensors="pt",
+            add_special_tokens=False)["input_ids"][0].to(self.device))
 
-# ============================================================
-# 10. Collect predictions
-# ============================================================
+        seqs = [torch.cat([ins1, e, ins2], dim=0) for e in window_embs]
+        max_len = max(s.shape[0] for s in seqs)
+        D = seqs[0].shape[1]
+        padded = torch.zeros(B, max_len, D, dtype=self.compute_dtype,
+                             device=self.device)
+        mask = torch.zeros(B, max_len, dtype=torch.long, device=self.device)
+        for b, s in enumerate(seqs):
+            n = s.shape[0]
+            padded[b, :n] = s
+            mask[b, :n] = 1
 
-@torch.no_grad()
-def collect_predictions(model, loader, device, line_cache, desc="collect") -> dict:
-    model.eval()
-    all_logits, all_probs, all_bce, all_labels = [], [], [], []
+        out = self.llama(inputs_embeds=padded, attention_mask=mask,
+                         output_hidden_states=True)
+        hidden = out.hidden_states[-1]
+        last_idx = mask.sum(dim=1) - 1
+        last_hidden = hidden[torch.arange(B, device=self.device), last_idx]
+        return self.classifier(last_hidden.float()).squeeze(-1)
 
-    pbar = tqdm.tqdm(loader, desc=desc, leave=False)
-    for raw_batch in pbar:
-        batch = pack_batch(raw_batch, line_cache, device)
+    # ---------- Train modes ----------
+    def set_train_mode(self, mode: str):
+        """'llama' | 'head' | 'encoder' | 'all'"""
+        for p in self.parameters():
+            p.requires_grad = False
 
-        if batch is None:
-            continue
-        log_embs = batch["log_embs"].to(device)
-        mask = batch["attention_mask"].to(device)
-        y = batch["labels"].to(device)
+        if mode == "llama":
+            for n, p in self.llama.named_parameters():
+                if "lora" in n:
+                    p.requires_grad = True
+            return
 
-        logits = model(log_embs, batch["times"], mask)
-        logits_f = logits.float()
-        bce_per = F.binary_cross_entropy_with_logits(
-            logits_f, y.float(), reduction="none")
+        # head: projector + classifier + aggregator (+ time fusion)
+        for m in (self.projector, self.classifier, self.aggregator):
+            for p in m.parameters():
+                p.requires_grad = True
+        if self.use_time and self.fusion_type in ("cross_attention", "concat"):
+            for p in self.time_encoder.parameters():
+                p.requires_grad = True
+            if self.fusion_type == "cross_attention":
+                for p in self.cross_attn.parameters():
+                    p.requires_grad = True
+            elif self.fusion_type == "concat":
+                for p in self.concat_proj.parameters():
+                    p.requires_grad = True
 
-        all_logits.append(logits_f.cpu().numpy())
-        all_probs.append(torch.sigmoid(logits_f).cpu().numpy())
-        all_bce.append(bce_per.cpu().numpy())
-        all_labels.append(y.cpu().numpy())
+        if mode in ("encoder", "all"):
+            for n, p in self.encoder.named_parameters():
+                if "lora" in n:
+                    p.requires_grad = True
+        if mode == "all":
+            for n, p in self.llama.named_parameters():
+                if "lora" in n:
+                    p.requires_grad = True
 
-    if not all_logits:
-        z = np.zeros(0, np.float32)
-        return {"logits": z, "probs": z, "bce": z,
-                "labels": np.zeros(0, np.int8)}
+    # ---------- Save / Load ----------
+    def save(self, path: str):
+        os.makedirs(path, exist_ok=True)
+        self.encoder.save_pretrained(os.path.join(path, "encoder_lora"))
+        self.llama.save_pretrained(os.path.join(path, "llama_lora"))
+        for name in ("projector", "classifier", "aggregator"):
+            torch.save(getattr(self, name).state_dict(),
+                       os.path.join(path, f"{name}.pt"))
+        if self.use_time and self.fusion_type in ("cross_attention", "concat"):
+            torch.save(self.time_encoder.state_dict(),
+                       os.path.join(path, "time_encoder.pt"))
+            name = ("cross_attn" if self.fusion_type == "cross_attention"
+                    else "concat_proj")
+            torch.save(getattr(self, name).state_dict(),
+                       os.path.join(path, f"{name}.pt"))
 
-    return {
-        "logits": np.concatenate(all_logits).astype(np.float32),
-        "probs":  np.concatenate(all_probs).astype(np.float32),
-        "bce":    np.concatenate(all_bce).astype(np.float32),
-        "labels": np.concatenate(all_labels).astype(np.int8),
-    }
+    def load(self, path: str):
+        from peft import set_peft_model_state_dict
+        from safetensors.torch import load_file
 
+        for sub, model in (("encoder_lora", self.encoder),
+                            ("llama_lora", self.llama)):
+            d = os.path.join(path, sub)
+            if not os.path.isdir(d):
+                continue
+            state = None
+            for fn in ("adapter_model.safetensors", "adapter_model.bin"):
+                fp = os.path.join(d, fn)
+                if os.path.exists(fp):
+                    state = (load_file(fp) if fn.endswith(".safetensors")
+                             else torch.load(fp, map_location="cpu"))
+                    break
+            if state is not None:
+                set_peft_model_state_dict(model, state)
 
-# ============================================================
-# 11. Save / load
-# ============================================================
+        for name in ("projector", "classifier", "aggregator"):
+            fp = os.path.join(path, f"{name}.pt")
+            if os.path.exists(fp):
+                getattr(self, name).load_state_dict(
+                    torch.load(fp, map_location=self.device))
 
-def save_trainable(model, optimizer, scheduler, epoch, global_step, save_dir):
-    os.makedirs(save_dir, exist_ok=True)
-
-    if isinstance(getattr(model, "longformer", None), PeftModel):
-        model.longformer.save_pretrained(os.path.join(save_dir, "adapter"))
-        mode = "peft"
-    elif hasattr(model, "encoder"):
-        torch.save(model.encoder.state_dict(),
-                   os.path.join(save_dir, "encoder.pt"))
-        mode = "full"
-    else:
-        torch.save(model.state_dict(),
-                   os.path.join(save_dir, "model.pt"))
-        mode = "whole"
-
-    head_state = (model.head_state_dict()
-                  if hasattr(model, "head_state_dict") else None)
-
-    torch.save({
-        "mode": mode,
-        "head_state": head_state,
-        "optimizer":  optimizer.state_dict(),
-        "scheduler":  scheduler.state_dict(),
-        "epoch":      epoch,
-        "global_step": global_step,
-    }, os.path.join(save_dir, "train_state.pt"))
-
-
-def load_adapter_into(model, save_dir: str):
-    from peft import set_peft_model_state_dict
-    from safetensors.torch import load_file
-
-    adapter_dir = os.path.join(save_dir, "adapter")
-    if os.path.isdir(adapter_dir) and isinstance(model.longformer, PeftModel):
-        state = None
-        for fname in ("adapter_model.safetensors", "adapter_model.bin"):
-            path = os.path.join(adapter_dir, fname)
-            if os.path.exists(path):
-                state = (load_file(path) if fname.endswith(".safetensors")
-                         else torch.load(path, map_location="cpu"))
-                break
-        if state is None:
-            raise FileNotFoundError(f"нет adapter_model.* в {adapter_dir}")
-        set_peft_model_state_dict(model.longformer, state)
-        print(f"[load_adapter] PEFT keys: {len(state)}")
-        if hasattr(model.longformer, "set_adapter"):
-            try:
-                model.longformer.set_adapter("default")
-            except Exception:
-                pass
-        for n, p in model.longformer.named_parameters():
-            if "lora_" in n:
-                p.requires_grad_(True)
-        return
-
-    enc_path = os.path.join(save_dir, "encoder.pt")
-    if os.path.exists(enc_path):
-        state = torch.load(enc_path, map_location="cpu")
-        model.encoder.load_state_dict(state, strict=False)
-        print(f"[load_adapter] full encoder.pt, {len(state)} keys")
-        return
-
-    model_path = os.path.join(save_dir, "model.pt")
-    if os.path.exists(model_path):
-        state = torch.load(model_path, map_location="cpu")
-        model.load_state_dict(state, strict=False)
-        print(f"[load_adapter] whole model.pt, {len(state)} keys")
-        return
-
-    raise FileNotFoundError(f"нет adapter/, encoder.pt или model.pt в {save_dir}")
+        if self.use_time and self.fusion_type in ("cross_attention", "concat"):
+            fp = os.path.join(path, "time_encoder.pt")
+            if os.path.exists(fp):
+                self.time_encoder.load_state_dict(
+                    torch.load(fp, map_location=self.device))
+            name = ("cross_attn" if self.fusion_type == "cross_attention"
+                    else "concat_proj")
+            fp = os.path.join(path, f"{name}.pt")
+            if os.path.exists(fp):
+                getattr(self, name).load_state_dict(
+                    torch.load(fp, map_location=self.device))
