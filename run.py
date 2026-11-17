@@ -32,6 +32,7 @@ from dataset import (
     get_preprocess_fn, normalize_text,
 )
 from model import LogLLM, ENCODER_PRESETS, resolve_encoder
+from typing import Literal, Optional
 
 
 # ============================================================
@@ -46,11 +47,11 @@ def _stub_preprocess(s: str) -> str:
 @dataclasses.dataclass
 class Config:
     # ---- data ----
-    dataset: str = "liberty"
-    win_size: int = 199
-    step_size: int = 199
+    dataset: str = "tbird"
+    win_size: int = 100
+    step_size: int = 100
     anchor_step: int = 10
-    batch_size: int = 16
+    batch_size: int = 4
     num_workers: int = 4
     use_in_colab: bool = True
     max_lines: typing.Optional[int] = None
@@ -68,7 +69,7 @@ class Config:
     cache_dir: str = "/content/cache"
 
     # ---- split ----
-    eval_start_ratio: float = 0.9
+    eval_start_ratio: float = 0.8
     train_ratio: float = 0.3
     target_ratio: float = 0.3
 
@@ -94,6 +95,10 @@ class Config:
     llama_path: str = "meta-llama/Meta-Llama-3-8B"
     llama_lora_r: int = 16
     llama_lora_alpha: int = 32
+    decoder_lora_dropout: float = 0.1
+    decoder_tokenizer_padding_side: Optional[Literal['right', 'left']] = None
+    decoder_target_modules: list[str] = dataclasses.field(
+        default_factory=lambda: ["q_proj", "k_proj", "v_proj", "o_proj"])
 
     # ---- compute dtype ----
     compute_dtype: str = "bf16"         # "bf16"|"fp16"|"fp32"|"tf32"
@@ -116,7 +121,7 @@ class Config:
     # ---- training ----
     grad_accum_steps: int = 4
     weight_decay: float = 0.05
-    warmup_steps: int = 200
+    warmup_steps: int = 10
     grad_clip: float = 1.0
 
     # ---- scheduler ----
@@ -144,7 +149,7 @@ class Config:
     # {1,2}  — stage1+stage2 (быстрее, но теряете baseline head)
     # set()  — eval на всех стадиях (для абляций)
     skip_eval_stages: typing.Set[int] = dataclasses.field(
-        default_factory=lambda: {1})
+        default_factory=lambda: {1, 2})
 
     # ---- sampler ----
     sampler_max_oversample: float = 10.0
@@ -534,8 +539,21 @@ def train_one_stage(model, train_loader, val_loader, cfg, device,
     print(f"[{stage_name}] mode={_STAGE_MODE[stage_name]} "
           f"trainable={sum(p.numel() for p in trainable):,}")
 
-    optimizer = torch.optim.AdamW(trainable, lr=lr,
-                                   weight_decay=cfg.weight_decay)
+    decay, no_decay = [], []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if p.dim() <= 1:  # bias, LayerNorm weight/bias
+            no_decay.append(p)
+        elif "LayerNorm" in name or "layer_norm" in name.lower() or "layernorm" in name.lower() or "bias" in name.lower():
+            no_decay.append(p)
+        else:
+            decay.append(p)
+
+    optimizer = torch.optim.AdamW([{'params':decay, 'weight_decay': cfg.weight_decay, 'lr':lr},  # для весов
+        {'params': no_decay, 'weight_decay': 0.0, 'lr':lr}  # для смещений
+    ])
+
     accum = max(1, cfg.grad_accum_steps)
     steps_per_epoch = max(1, math.ceil(len(train_loader) / accum))   # fix 1
     total_steps = steps_per_epoch * n_epochs

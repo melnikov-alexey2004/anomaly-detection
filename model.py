@@ -254,7 +254,7 @@ class LogLLM(nn.Module):
             self.encoder = AutoModel.from_pretrained(
                 enc_spec["path"], config=enc_cfg,
                 quantization_config=enc_bnb,
-                low_cpu_mem_usage=True, device_map=device)
+                device_map=device) # low_cpu_mem_usage=True,  ???
             self.encoder = prepare_model_for_kbit_training(self.encoder)
         else:
             self.encoder = AutoModel.from_pretrained(
@@ -293,7 +293,7 @@ class LogLLM(nn.Module):
             bnb_4bit_quant_type="nf4",
             bnb_4bit_compute_dtype=self.compute_dtype)
         self.llama_tokenizer = AutoTokenizer.from_pretrained(
-            config.llama_path, padding_side="right")
+            config.llama_path, padding_side=config.decoder_tokenizer_padding_side)
         self.llama_tokenizer.pad_token = self.llama_tokenizer.eos_token
         self.llama = AutoModelForCausalLM.from_pretrained(
             config.llama_path, quantization_config=llama_bnb,
@@ -301,8 +301,8 @@ class LogLLM(nn.Module):
         self.llama = prepare_model_for_kbit_training(self.llama)
         self.llama = get_peft_model(self.llama, LoraConfig(
             r=config.llama_lora_r, lora_alpha=config.llama_lora_alpha,
-            lora_dropout=0.1,
-            target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+            lora_dropout=config.decoder_lora_dropout,
+            target_modules=config.decoder_target_modules,
             bias="none", task_type=TaskType.CAUSAL_LM))
         self.llama_dim = self.llama.config.hidden_size
 
