@@ -328,6 +328,8 @@ class LogLLM(nn.Module):
                 enc_spec["path"], config=enc_cfg,
                 torch_dtype=self.compute_dtype,
                 low_cpu_mem_usage=True).to(device)
+            self.encoder.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False})
 
         self.encoder_dim = self.encoder.config.hidden_size
         self._longformer_like = _is_longformer_like(self.encoder.config)

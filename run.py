@@ -8,6 +8,7 @@ Stages:
   stage4 'all'     -> head + encoder + decoder LoRA
 """
 import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import re
 import math
 import time
@@ -54,6 +55,8 @@ class Config:
     step_size: int = 100
     anchor_step: int = 10
     batch_size: int = 4
+    stage_batch_sizes: typing.Optional[typing.Dict[int, int]] = None
+    stage_batch_sizes_on_evaluation: typing.Optional[typing.Dict[int, int]] = None
     num_workers: int = 4
     use_in_colab: bool = True
     max_lines: typing.Optional[int] = None
@@ -399,6 +402,7 @@ def _build_loaders(cfg: Config, ds, val_ds, collator, stage_idx: int,
                     template_only: bool = False,
                     need_val: bool = True):
     ratio = cfg.train_ratio
+    
     if cfg.stage_train_ratios and stage_idx in cfg.stage_train_ratios:
         ratio = cfg.stage_train_ratios[stage_idx]
     min_ratio = 0.0
@@ -434,21 +438,29 @@ def _build_loaders(cfg: Config, ds, val_ds, collator, stage_idx: int,
         # cache_dir=cache_dir,
     )
 
+    stats = getattr(sampler, "stats", {}) or {}
     print(f"[loaders] stage{stage_idx} range=[{safe_min},{safe_max}) "
           f"target_ratio={target_ratio} sampler_len={len(sampler)} "
-          f"minority={getattr(sampler, 'minority_count', '?')}"
+          f"n_min={stats.get('n_min_natural', '?')} "
+          f"n_maj={stats.get('n_maj_natural', '?')} "
+          f"n_min_target={stats.get('n_min_target', '?')} "
+          f"n_maj_target={stats.get('n_maj_target', '?')} "
+          f"reason={stats.get('reason', '?')}"
           f"{' (template)' if template_only else ''}"
           f"{' (no val)' if not need_val else ''}")
 
+    bs = cfg.stage_batch_sizes.get(stage_idx, cfg.batch_size)
+    eval_bs = cfg.stage_batch_sizes_on_evaluation.get(stage_idx, cfg.batch_size)
+
     train_loader = DataLoader(
-        ds, batch_size=cfg.batch_size, sampler=sampler,
+        ds, batch_size=bs, sampler=sampler,
         collate_fn=collator, num_workers=cfg.num_workers,
-        drop_last=True, persistent_workers=cfg.num_workers > 0)
+        drop_last=True, persistent_workers=False)
 
     if need_val:
         val_loader = DataLoader(
             LimitedIterable(val_ds, cfg.eval_max_windows),
-            batch_size=cfg.batch_size, shuffle=False,
+            batch_size=eval_bs, shuffle=False,
             collate_fn=collator, num_workers=cfg.num_workers)
     else:
         val_loader = None
