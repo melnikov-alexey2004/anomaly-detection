@@ -300,7 +300,7 @@ class LogLLM(nn.Module):
         self.llama = AutoModelForCausalLM.from_pretrained(
             config.llama_path, quantization_config=llama_bnb,
             low_cpu_mem_usage=True, device_map=device)
-        self.llama = prepare_model_for_kbit_training(self.llama)
+        self.llama = prepare_model_for_kbit_training(self.llama, use_gradient_checkpointing=False)
         self.llama.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs={"use_reentrant": False})
 
@@ -427,10 +427,11 @@ class LogLLM(nn.Module):
             else:
                 last_idx = mask.sum(dim=1) - 1
 
-            last_hidden = hidden[torch.arange(B, device=self.device), last_idx]
+            last_hidden = hidden[torch.arange(B, device=self.device), last_idx] # hidden.device #todo:
         elif self.cfg.decoder_head_pooling == "mean":
             # bs, sl, hs x  bs, sl, 1
-            last_hidden = (hidden * mask.unsqueeze(-1)).sum(1) / mask.sum(1, keepdim=True)
+            m = mask.unsqueeze(-1).to(hidden.dtype)
+            last_hidden = (hidden * m).sum(1) / m.sum(1).clamp_min(1.0)
         return self.classifier(last_hidden.float()).squeeze(-1)
 
     # ---------- Train modes ----------

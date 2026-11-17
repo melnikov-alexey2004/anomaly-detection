@@ -32,7 +32,7 @@ from dataset import (
     get_preprocess_fn, normalize_text,
 )
 from model import LogLLM, ENCODER_PRESETS, resolve_encoder
-from typing import Literal, Optional
+from typing import Literal, Optional, Union
 
 
 # ============================================================
@@ -585,25 +585,29 @@ def train_one_stage(model, train_loader, val_loader, cfg, device,
         optimizer.zero_grad(set_to_none=True)
         t0 = time.time()
         pbar = tqdm.tqdm(train_loader, desc=f"{stage_name} e{epoch}")
-        for batch in pbar:
+        for step_idx, batch in enumerate(pbar, 1):
             if batch is None:
                 continue
             logits = model(batch)
             loss = criterion(logits, batch["labels"].to(device))
             if torch.isnan(loss) or torch.isinf(loss):
+                optimizer.zero_grad(set_to_none=True)
                 continue
             (loss / accum).backward()
             running += loss.item()
             n_b += 1
             acc_count += 1
 
-            if acc_count % accum == 0 or acc_count == len(train_loader):
+            is_last = (step_idx == len(train_loader))
+            if acc_count % accum == 0 or is_last:
                 if cfg.grad_clip:
                     torch.nn.utils.clip_grad_norm_(trainable, cfg.grad_clip)
-                optimizer.step()
+                optimizer.step();
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
+                acc_count = 0
+
             pbar.set_postfix({"loss": f"{running / n_b:.4f}",
                               "lr": f"{scheduler.get_last_lr()[0]:.2e}"})
 
@@ -692,6 +696,7 @@ def run(cfg: Config):
         train_one_stage(model, tr, va, cfg, device,
                         n_epochs=cfg.n_epochs_stage1, lr=cfg.lr_stage1,
                         stage_name="stage1", save_dir=save_dir)
+        torch.cuda.empty_cache()
         try:
             _save_llama_template(model, template_repo)
         except Exception as e:
@@ -708,6 +713,7 @@ def run(cfg: Config):
                         n_epochs=getattr(cfg, f"n_epochs_{name}"),
                         lr=getattr(cfg, f"lr_{name}"),
                         stage_name=name, save_dir=save_dir)
+        torch.cuda.empty_cache()
 
     print(f"\n[done] checkpoints → {save_dir}")
     return {"model": model, "dataset": ds, "val_dataset": val_ds,
@@ -752,7 +758,8 @@ def _resolve_resume_path(cfg: Config) -> str:
 
 def continue_learning(cfg: Config):
     random.seed(cfg.seed); np.random.seed(cfg.seed)
-    torch.manual_seed(cfg.seed); torch.cuda.manual_seed_all(cfg.seed)
+    torch.manual_seed(cfg.seed)
+    # torch.cuda.manual_seed_all(cfg.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[env] device={device}")
