@@ -1,10 +1,19 @@
 """
 LogLLM: encoder-agnostic (BERT / RoBERTa / DeBERTa-v3 / Longformer / BigBird)
-+ Llama 3.x QLoRA + LayerAggregator (last-K, masked pooling) + time fusion.
++ decoder QLoRA (Llama 3.x / Qwen 3.5 / etc.) + LayerAggregator + time fusion.
+
+Decoder-style classification:
+  logs → encoder → projector → fusion → ins1 + seq + ins2
+       → text transformer (last valid token)
+       → lm_head[[normal_id, anomalous_id]] → 2-class logits
+
+Training loss: CrossEntropyLoss.
+Inference: softmax(logits)[:, 1] = P(anomalous).
 """
 import os
 import math
 import typing
+
 import bitsandbytes as bnb
 import torch
 import torch.nn as nn
@@ -49,8 +58,8 @@ def resolve_encoder(encoder: str, overrides: typing.Optional[dict] = None) -> di
 
 def _auto_lora_targets(model) -> typing.List[str]:
     names = {n for n, _ in model.named_modules()}
-    for cand in (("query", "value"),                # BERT/RoBERTa/Longformer/BigBird
-                 ("query_proj", "value_proj"),      # DeBERTa-v2/v3
+    for cand in (("query", "value"),
+                 ("query_proj", "value_proj"),
                  ("q_lin", "v_lin")):
         if all(any(n.endswith(c) for n in names) for c in cand):
             return list(cand)
@@ -73,6 +82,62 @@ def _resolve_dtype(name: str) -> torch.dtype:
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
     return _DTYPES[name]
+
+
+# ============================================================
+# Universal decoder helpers
+#   Works for: Llama-3, Qwen3.5 (multimodal), Mistral, Gemma,
+#              GPT-2 (transformer.h), T5/BART (blocks), etc.
+# ============================================================
+
+def _unwrap(model):
+    """PeftModel -> base model."""
+    return model.get_base_model() if hasattr(model, "get_base_model") else model
+
+
+def _get_text_transformer(model) -> nn.Module:
+    """
+    Locate the pure text transformer inside any decoder.
+    Returns the module that contains the actual stack of layers
+    (last_hidden_state is produced by its forward output).
+    """
+    base = _unwrap(model)
+    m = base
+    for _ in range(8):
+        for attr in ("layers", "blocks", "h"):
+            if hasattr(m, attr):
+                return m
+        if hasattr(m, "language_model"):         # Qwen3.5, Gemma3 (multimodal)
+            m = m.language_model
+            continue
+        if hasattr(m, "transformer"):            # GPT-2 style
+            m = m.transformer
+            continue
+        if hasattr(m, "model"):                  # Llama / Qwen / Mistral
+            m = m.model
+            continue
+        break
+
+    children = list(dict(base.named_children()))
+    raise RuntimeError(
+        f"cannot locate text transformer in {type(base).__name__}; "
+        f"children={children}")
+
+
+def _get_lm_head(model) -> nn.Linear:
+    base = _unwrap(model)
+    head = base.get_output_embeddings()
+    if head is None:
+        raise RuntimeError(f"no lm_head in {type(base).__name__}")
+    return head
+
+
+def _get_input_embeddings(model) -> nn.Embedding:
+    base = _unwrap(model)
+    emb = base.get_input_embeddings()
+    if emb is None:
+        raise RuntimeError(f"no input embeddings in {type(base).__name__}")
+    return emb
 
 
 # ============================================================
@@ -144,7 +209,7 @@ class TimeFeatureEncoder(nn.Module):
         L_max = max(Ls) if Ls else 1
         params = list(self.parameters())
         device = params[0].device if params else torch.device("cpu")
-        feats = torch.zeros(B, L_max, self._in_dim(), device=device)   # fp32
+        feats = torch.zeros(B, L_max, self._in_dim(), device=device)
         for b, t_list in enumerate(times_list):
             L = len(t_list); parts = []
             if self.use_delta:
@@ -175,7 +240,7 @@ class CrossAttentionFusion(nn.Module):
 
 
 # ============================================================
-# LayerAggregator — как в LogAnomalyModel
+# LayerAggregator
 # ============================================================
 
 class LayerAggregator(nn.Module):
@@ -195,7 +260,7 @@ class LayerAggregator(nn.Module):
             raise ValueError(f"unknown pooling={pooling!r}")
 
     def forward(self, hidden_states, attention_mask):
-        hs = torch.stack(hidden_states[-self.k:], dim=0)   # [K,B,L,D]
+        hs = torch.stack(hidden_states[-self.k:], dim=0)
 
         if self.mode == "attn_pool":
             h = hs.mean(dim=0)
@@ -208,7 +273,7 @@ class LayerAggregator(nn.Module):
             h = hs[-1]
         elif self.mode == "mean":
             h = hs.mean(dim=0)
-        else:  # weighted
+        else:
             w = torch.softmax(self.layer_weights, dim=0)
             h = (hs * w.view(-1, 1, 1, 1)).sum(dim=0)
 
@@ -217,7 +282,6 @@ class LayerAggregator(nn.Module):
         if self.pooling == "mean":
             m = attention_mask.unsqueeze(-1).to(h.dtype)
             return (h * m).sum(dim=1) / m.sum(dim=1).clamp_min(1.0)
-        # max
         m = attention_mask.unsqueeze(-1).bool()
         return h.masked_fill(~m, -1e9).max(dim=1).values
 
@@ -254,8 +318,9 @@ class LogLLM(nn.Module):
             self.encoder = AutoModel.from_pretrained(
                 enc_spec["path"], config=enc_cfg,
                 quantization_config=enc_bnb,
-                device_map=device) # low_cpu_mem_usage=True,  ???
-            self.encoder = prepare_model_for_kbit_training(self.encoder, use_gradient_checkpointing=False)
+                device_map=device)
+            self.encoder = prepare_model_for_kbit_training(
+                self.encoder, use_gradient_checkpointing=False)
             self.encoder.gradient_checkpointing_enable(
                 gradient_checkpointing_kwargs={"use_reentrant": False})
         else:
@@ -279,8 +344,7 @@ class LogLLM(nn.Module):
         ).to(device)
 
         # ---------- Encoder LoRA ----------
-        lora_targets = (config.encoder_lora_targets
-                        or _auto_lora_targets(self.encoder))
+        lora_targets = config.encoder_lora_targets or _auto_lora_targets(self.encoder)
         print(f"[encoder] {enc_spec['path']} | dim={self.encoder_dim} | "
               f"K={self.encoder_last_layers} agg={self.encoder_layer_agg} "
               f"pool={self.encoder_pooling} | lora={lora_targets}")
@@ -289,38 +353,73 @@ class LogLLM(nn.Module):
             r=config.encoder_lora_r, lora_alpha=config.encoder_lora_alpha,
             lora_dropout=0.01, target_modules=lora_targets))
 
-        # ---------- Llama QLoRA ----------
+        # ---------- Decoder QLoRA ----------
         llama_bnb = BitsAndBytesConfig(
             load_in_4bit=True, bnb_4bit_use_double_quant=True,
             bnb_4bit_quant_type="nf4",
             bnb_4bit_compute_dtype=self.compute_dtype)
-        self.llama_tokenizer = AutoTokenizer.from_pretrained(
-            config.llama_path)
-        self.llama_tokenizer.pad_token = self.llama_tokenizer.eos_token
+        self.llama_tokenizer = AutoTokenizer.from_pretrained(config.llama_path)
+        if self.llama_tokenizer.pad_token is None:
+            self.llama_tokenizer.pad_token = self.llama_tokenizer.eos_token
+
         self.llama = AutoModelForCausalLM.from_pretrained(
-            config.llama_path, quantization_config=llama_bnb, torch_dtype=self.compute_dtype,
-            low_cpu_mem_usage=True, device_map=device)
-        self.llama = prepare_model_for_kbit_training(self.llama, use_gradient_checkpointing=False)
+            config.llama_path,
+            quantization_config=llama_bnb,
+            torch_dtype=self.compute_dtype,
+            low_cpu_mem_usage=True,
+            device_map=device,
+        )
+        self.llama = prepare_model_for_kbit_training(
+            self.llama, use_gradient_checkpointing=False)
         self.llama.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs={"use_reentrant": False})
-
         self.llama = get_peft_model(self.llama, LoraConfig(
             r=config.llama_lora_r, lora_alpha=config.llama_lora_alpha,
             lora_dropout=config.decoder_lora_dropout,
             target_modules=config.decoder_target_modules,
             bias="none", task_type=TaskType.CAUSAL_LM))
 
+        # Sanitize dtype of non-quantized Linear / Conv1d
+        n_cast = 0
         for name, module in self.llama.named_modules():
             if isinstance(module, nn.Linear) and not isinstance(module, bnb.nn.Linear4bit):
                 if module.weight.dtype != self.compute_dtype:
                     module.to(self.compute_dtype)
-                    print(f"[cast] {name}: fp32 -> {self.compute_dtype}")
+                    n_cast += 1
             elif isinstance(module, nn.Conv1d):
                 if module.weight.dtype != self.compute_dtype:
                     module.to(self.compute_dtype)
-                    print(f"[cast] {name} (Conv1d): -> {self.compute_dtype}")
+                    n_cast += 1
+        if n_cast:
+            print(f"[decoder] cast {n_cast} modules to {self.compute_dtype}")
 
-        self.llama_dim = self.llama.config.hidden_size
+        # ---------- Universal decoder components ----------
+        self._text_transformer = _get_text_transformer(self.llama)
+        self._lm_head = _get_lm_head(self.llama)
+        self._embed_tokens = _get_input_embeddings(self.llama)
+        self.llama_dim = self._lm_head.in_features
+        print(f"[decoder] transformer={type(self._text_transformer).__name__} "
+              f"lm_head=Linear({self._lm_head.in_features}->{self._lm_head.out_features}) "
+              f"head_device={self._lm_head.weight.device}")
+
+        # ---------- Class tokens (normal / anomalous) ----------
+        tok = self.llama_tokenizer
+        normal_ids = tok("normal", add_special_tokens=False)["input_ids"]
+        anom_ids   = tok("anomalous", add_special_tokens=False)["input_ids"]
+        if not normal_ids or not anom_ids:
+            raise ValueError("tokenizer returned empty id list for class token")
+        if normal_ids[0] == anom_ids[0]:
+            raise ValueError(
+                "First token of 'normal' and 'anomalous' are identical "
+                f"(id={normal_ids[0]}). Pick different label words, "
+                "e.g. 'healthy' / 'broken'.")
+        self._normal_id = int(normal_ids[0])
+        self._anom_id   = int(anom_ids[0])
+        # kept on self.device; moved to head.device inside forward()
+        self._class_ids = torch.tensor([self._normal_id, self._anom_id],
+                                       dtype=torch.long, device=device)
+        print(f"[class tokens] normal={self._normal_id} anomalous={self._anom_id} "
+              f"(-> class 0 / class 1)")
 
         # ---------- Projector ----------
         self.projector = nn.Linear(self.encoder_dim, self.llama_dim).to(device)
@@ -340,16 +439,18 @@ class LogLLM(nn.Module):
                 self.concat_proj = nn.Linear(2 * self.llama_dim,
                                               self.llama_dim).to(device)
 
-        # ---------- Head ----------
-        self.classifier = nn.Sequential(
-            nn.Linear(self.llama_dim, 256),
-            nn.GELU(), nn.Dropout(0.1), nn.Linear(256, 1),
-        ).to(device)
-
+        # ---------- Instruction embeddings (cached) ----------
         self.ins1_str = "Below is a sequence of system log messages:"
         self.ins2_str = ". Is this sequence normal or anomalous?"
+        with torch.no_grad():
+            ids1 = tok(self.ins1_str, return_tensors="pt",
+                       add_special_tokens=False)["input_ids"][0].to(device)
+            ids2 = tok(self.ins2_str, return_tensors="pt",
+                       add_special_tokens=False)["input_ids"][0].to(device)
+            self._ins1_emb = self._embed_tokens(ids1).to(self.compute_dtype)
+            self._ins2_emb = self._embed_tokens(ids2).to(self.compute_dtype)
 
-    # ---------- Encode ----------
+    # ---------- Encoder path ----------
     def _encode_logs(self, enc_inputs, seq_positions):
         need_hs = self.encoder_last_layers > 1
         out = self.encoder(**enc_inputs, output_hidden_states=need_hs)
@@ -367,87 +468,76 @@ class LogLLM(nn.Module):
         L_max = max(Ls) if Ls else 1
         D = window_embs[0].shape[1]
 
-        padded = torch.zeros(B, L_max, D, dtype=self.compute_dtype,
-                             device=self.device)
+        padded = torch.zeros(B, L_max, D, dtype=self.compute_dtype, device=self.device)
         mask = torch.zeros(B, L_max, dtype=torch.long, device=self.device)
         for b, e in enumerate(window_embs):
             n = e.shape[0]
             padded[b, :n] = e
             mask[b, :n] = 1
 
-        time_emb = self.time_encoder(times_list)  # fp32
-        padded_fp32 = padded.float()  # ← каст для fusion
+        time_emb = self.time_encoder(times_list)
+        padded_fp32 = padded.float()
 
         if self.fusion_type == "cross_attention":
             fused = self.cross_attn(time_emb, padded_fp32, log_mask=mask)
         elif self.fusion_type == "concat":
+            assert padded_fp32.shape[1] == time_emb.shape[1], (
+                f"concat fusion needs equal seq lengths: "
+                f"logs={padded_fp32.shape[1]} times={time_emb.shape[1]}. "
+                "Check that len(times_list[b]) == len(window_embs[b]).")
             fused = self.concat_proj(torch.cat([padded_fp32, time_emb], dim=-1))
         else:
             fused = padded_fp32
 
-        fused = fused.to(self.compute_dtype)  # ← обратно в bf16
+        fused = fused.to(self.compute_dtype)
         return [fused[b, :Ls[b]] for b in range(B)]
 
-    # ---------- Forward ----------
+    # ---------- Forward (decoder-style 2-class CE) ----------
     def forward(self, batch):
-        enc_inputs = {k: v.to(self.device)
-                      for k, v in batch["bert_inputs"].items()}
-
+        enc_inputs = {k: v.to(self.device) for k, v in batch["bert_inputs"].items()}
         if self._longformer_like:
-            g = torch.zeros_like(enc_inputs["attention_mask"])
-            g[:, 0] = 1
+            g = torch.zeros_like(enc_inputs["attention_mask"]); g[:, 0] = 1
             enc_inputs["global_attention_mask"] = g
 
         seq_positions = batch["seq_positions"].tolist()
-        times_list = batch["times"]
+        times_list    = batch["times"]
         B = len(times_list)
 
         window_embs = self._encode_logs(enc_inputs, seq_positions)
         window_embs = self._apply_fusion(window_embs, times_list)
 
-        embed = self.llama.get_input_embeddings()
-        ins1 = embed(self.llama_tokenizer(
-            self.ins1_str, return_tensors="pt",
-            add_special_tokens=False)["input_ids"][0].to(self.device)
-                     ).to(self.compute_dtype)
-        ins2 = embed(self.llama_tokenizer(
-            self.ins2_str, return_tensors="pt",
-            add_special_tokens=False)["input_ids"][0].to(self.device)
-                     ).to(self.compute_dtype)
-
-        seqs = [torch.cat([ins1, e, ins2], dim=0) for e in window_embs]
+        seqs = [torch.cat([self._ins1_emb, e, self._ins2_emb], dim=0)
+                for e in window_embs]
         max_len = max(s.shape[0] for s in seqs)
         D = seqs[0].shape[1]
-        padded = torch.zeros(B, max_len, D, dtype=self.compute_dtype,
-                             device=self.device)
-        mask = torch.zeros(B, max_len, dtype=torch.long, device=self.device)
+
+        padded = torch.zeros(B, max_len, D, dtype=self.compute_dtype, device=self.device)
+        mask   = torch.zeros(B, max_len, dtype=torch.long,        device=self.device)
         for b, s in enumerate(seqs):
             n = s.shape[0]
             padded[b, :n] = s
             mask[b, :n] = 1
 
-        # out = self.llama(inputs_embeds=padded, attention_mask=mask,
-        #                  output_hidden_states=False)
-        # hidden = out.hidden_states[-1]
-        #QWEN3.5 only
-        base_lm = self.llama.get_base_model()  # Qwen3_5ForCausalLM
-        multimodal = base_lm.model  # Qwen3_5Model (visual + language_model)
-        transformer = multimodal.language_model  # Qwen3_5TextModel
+        out = self._text_transformer(
+            inputs_embeds=padded, attention_mask=mask, use_cache=False)
+        hidden = out.last_hidden_state                                 # [B, L, D]
 
-        out = transformer(inputs_embeds=padded, attention_mask=mask, use_cache=False)
-        hidden = out.last_hidden_state
+        # last valid token, with correct device for gather
+        last_idx = (mask.sum(1) - 1).to(hidden.device)
+        last_hidden = hidden[
+            torch.arange(B, device=hidden.device), last_idx]           # [B, D]
 
-        if self.cfg.decoder_head_pooling == "last":
+        # 2-class logits via lm_head rows for class tokens
+        head_dev = self._lm_head.weight.device
+        class_ids = self._class_ids.to(head_dev)
+        W = self._lm_head.weight.index_select(0, class_ids)            # [2, D]
+        if self._lm_head.bias is not None:
+            b_vec = self._lm_head.bias.index_select(0, class_ids)      # [2]
+        else:
+            b_vec = torch.zeros(2, device=head_dev)
 
-            last_idx = mask.sum(dim=1) - 1
-            last_hidden = hidden[torch.arange(B, device=self.device), last_idx] # hidden.device #todo:
-        elif self.cfg.decoder_head_pooling == "mean":
-            # bs, sl, hs x  bs, sl, 1
-            m = mask.unsqueeze(-1).to(hidden.dtype)
-            last_hidden = (hidden * m).sum(1) / m.sum(1).clamp_min(1.0)
-
-
-        return self.classifier(last_hidden.float()).squeeze(-1)
+        logits_2 = last_hidden.float() @ W.float().t() + b_vec.float() # [B, 2]
+        return logits_2
 
     # ---------- Train modes ----------
     def set_train_mode(self, mode: str):
@@ -461,8 +551,8 @@ class LogLLM(nn.Module):
                     p.requires_grad = True
             return
 
-        # head: projector + classifier + aggregator (+ time fusion)
-        for m in (self.projector, self.classifier, self.aggregator):
+        # head: projector + aggregator + time fusion
+        for m in (self.projector, self.aggregator):
             for p in m.parameters():
                 p.requires_grad = True
         if self.use_time and self.fusion_type in ("cross_attention", "concat"):
@@ -489,7 +579,7 @@ class LogLLM(nn.Module):
         os.makedirs(path, exist_ok=True)
         self.encoder.save_pretrained(os.path.join(path, "encoder_lora"))
         self.llama.save_pretrained(os.path.join(path, "llama_lora"))
-        for name in ("projector", "classifier", "aggregator"):
+        for name in ("projector", "aggregator"):
             torch.save(getattr(self, name).state_dict(),
                        os.path.join(path, f"{name}.pt"))
         if self.use_time and self.fusion_type in ("cross_attention", "concat"):
@@ -519,7 +609,7 @@ class LogLLM(nn.Module):
             if state is not None:
                 set_peft_model_state_dict(model, state)
 
-        for name in ("projector", "classifier", "aggregator"):
+        for name in ("projector", "aggregator"):
             fp = os.path.join(path, f"{name}.pt")
             if os.path.exists(fp):
                 getattr(self, name).load_state_dict(

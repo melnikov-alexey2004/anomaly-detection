@@ -2,15 +2,18 @@
 LogLLM runner: Config + collator + tests + 4-stage training + continue_learning.
 
 Stages:
-  stage1 'llama'   — Llama LoRA only (shared template via HF)
-  stage2 'head'    — projector + classifier + aggregator (+ time fusion)
-  stage3 'encoder' — head + encoder LoRA
-  stage4 'all'     — head + encoder + llama LoRA (несколько эпох)
+  stage1 'llama'   -> decoder LoRA only (shared template via HF)
+  stage2 'head'    -> projector + aggregator + time fusion
+  stage3 'encoder' -> head + encoder LoRA
+  stage4 'all'     -> head + encoder + decoder LoRA
 """
 import os
+import re
 import math
 import time
 import random
+import hashlib
+import tempfile
 import typing
 import dataclasses
 import datetime as _dt
@@ -32,7 +35,7 @@ from dataset import (
     get_preprocess_fn, normalize_text,
 )
 from model import LogLLM, ENCODER_PRESETS, resolve_encoder
-from typing import Literal, Optional, Union
+from typing import Optional
 
 
 # ============================================================
@@ -40,7 +43,6 @@ from typing import Literal, Optional, Union
 # ============================================================
 
 def _stub_preprocess(s: str) -> str:
-    """Заглушка: ваш старый preprocessing (normalize_text)."""
     return normalize_text(s)
 
 
@@ -59,10 +61,9 @@ class Config:
     end_line: typing.Optional[int] = None
 
     # ---- preprocessing ----
-    # preprocess_mode (if set) takes priority over preprocess_fn.
     preprocess_fn: typing.Callable[[str], str] = dataclasses.field(
         default=_stub_preprocess)
-    preprocess_mode: typing.Optional[str] = None   # "none"|"normalize"|"replace"|"both"
+    preprocess_mode: typing.Optional[str] = None
 
     # ---- cache ----
     use_cache: bool = True
@@ -81,27 +82,26 @@ class Config:
     use_oversampling: bool = True
 
     # ---- encoder ----
-    encoder: str = "bert-base"                    # preset name OR hf path
+    encoder: str = "bert-base"
     encoder_overrides: typing.Optional[typing.Dict] = None
     encoder_lora_r: int = 8
     encoder_lora_alpha: int = 16
     encoder_lora_targets: typing.Optional[typing.List[str]] = None
     encoder_quantize: bool = False
     encoder_last_layers: int = 1
-    encoder_layer_agg: str = "last"     # "last"|"mean"|"weighted"|"attn_pool"
-    encoder_pooling: str = "mean"       # "cls"|"mean"|"max"
+    encoder_layer_agg: str = "last"
+    encoder_pooling: str = "mean"
 
-    # ---- Llama 3 / 3.1 / 3.2 ----
+    # ---- decoder (Llama 3.x / Qwen 3.x / etc.) ----
     llama_path: str = "meta-llama/Meta-Llama-3-8B"
     llama_lora_r: int = 16
     llama_lora_alpha: int = 32
     decoder_lora_dropout: float = 0.1
     decoder_target_modules: list[str] = dataclasses.field(
         default_factory=lambda: ["q_proj", "k_proj", "v_proj", "o_proj"])
-    decoder_head_pooling: Literal["last", "mean"] = "last"
 
     # ---- compute dtype ----
-    compute_dtype: str = "bf16"         # "bf16"|"fp16"|"fp32"|"tf32"
+    compute_dtype: str = "bf16"
 
     # ---- HF ----
     hf_token: typing.Optional[str] = None
@@ -113,7 +113,7 @@ class Config:
 
     # ---- time fusion ----
     use_time_features: bool = True
-    fusion_type: str = "cross_attention"   # "cross_attention"|"concat"|"projector"|"none"
+    fusion_type: str = "cross_attention"
     use_time2vec: bool = True
     use_cyclic_time: bool = True
     time_emb_len: int = 16
@@ -125,7 +125,7 @@ class Config:
     grad_clip: float = 1.0
 
     # ---- scheduler ----
-    scheduler_type: str = "polynomial"   # "polynomial"|"linear"|"cosine"|"constant"
+    scheduler_type: str = "polynomial"
     poly_power: float = 1.0
     min_lr: float = 1e-7
     cosine_min_ratio: float = 0.0
@@ -143,11 +143,6 @@ class Config:
 
     # ---- eval ----
     eval_max_windows: typing.Optional[int] = 2000
-
-    # ---- eval control ----
-    # {1}    — только stage1 пропускается (baseline head на stage2 сохраняется)
-    # {1,2}  — stage1+stage2 (быстрее, но теряете baseline head)
-    # set()  — eval на всех стадиях (для абляций)
     skip_eval_stages: typing.Set[int] = dataclasses.field(
         default_factory=lambda: {1, 2})
 
@@ -155,7 +150,7 @@ class Config:
     sampler_max_oversample: float = 10.0
     sampler_min_minority: int = 50
     max_samples: typing.Optional[int] = None
-    min_samples: typing.Optional[int] = None
+    # min_samples удалён — в текущем dataset.py он может нарушить кап
 
     # ---- continue_learning ----
     resume_from: typing.Optional[str] = None
@@ -322,11 +317,43 @@ def _login_hf(cfg: Config) -> str:
             print("[hf] already logged in")
         except Exception:
             notebook_login()
-    return whoami()["name"]
+
+    info = whoami()
+    # whoami() returns UserInfo dataclass in recent huggingface_hub,
+    # but dict in older versions.
+    name = getattr(info, "name", None)
+    if name is None and isinstance(info, dict):
+        name = info.get("name")
+    if not name:
+        raise RuntimeError(
+            "Could not determine HF username from whoami(); "
+            "pass cfg.hf_token explicitly or set template_repo_id.")
+    return name
 
 
 def _resolve_template_repo(cfg: Config, user_name: str) -> str:
-    return cfg.template_repo_id or f"{user_name}/llama3-8b-template"
+    """
+    Explicit template_repo_id wins. Otherwise derive
+        {user}/{model_slug}-{lora_fingerprint}-template
+    where model_slug = last path component of llama_path, sanitized,
+    and lora_fingerprint is a short hash of (r, alpha, targets)
+    so incompatible LoRA configs never collide on the same repo.
+    """
+    if cfg.template_repo_id:
+        return cfg.template_repo_id
+
+    base = cfg.llama_path.rstrip("/").split("/")[-1].lower()
+    slug = re.sub(r"[^a-z0-9._-]+", "-", base).strip("-") or "decoder"
+
+    fp_payload = "|".join([
+        slug,
+        str(cfg.llama_lora_r),
+        str(cfg.llama_lora_alpha),
+        ",".join(sorted(cfg.decoder_target_modules)),
+    ])
+    fp = hashlib.blake2b(fp_payload.encode(), digest_size=3).hexdigest()
+
+    return f"{user_name}/{slug}-{fp}-template"
 
 
 def _template_exists(repo_id: str) -> bool:
@@ -342,12 +369,12 @@ def _save_llama_template(model, repo_id: str):
     from huggingface_hub import HfApi
     api = HfApi()
     api.create_repo(repo_id, repo_type="model", exist_ok=True)
-    local = "/tmp/llama3_template"
-    os.makedirs(os.path.join(local, "llama_lora"), exist_ok=True)
-    model.llama.save_pretrained(os.path.join(local, "llama_lora"))
-    api.upload_folder(folder_path=local, repo_id=repo_id,
-                      path_in_repo=".", repo_type="model")
-    print(f"[template] saved → {repo_id}")
+    with tempfile.TemporaryDirectory(prefix="llama_tpl_") as local:
+        os.makedirs(os.path.join(local, "llama_lora"), exist_ok=True)
+        model.llama.save_pretrained(os.path.join(local, "llama_lora"))
+        api.upload_folder(folder_path=local, repo_id=repo_id,
+                          path_in_repo=".", repo_type="model")
+    print(f"[template] saved -> {repo_id}")
 
 
 def _load_llama_template(model, repo_id: str):
@@ -361,7 +388,7 @@ def _load_llama_template(model, repo_id: str):
         raise FileNotFoundError(fp)
     state = load_file(fp)
     set_peft_model_state_dict(model.llama, state)
-    print(f"[template] loaded ← {repo_id} ({len(state)} keys)")
+    print(f"[template] loaded <- {repo_id} ({len(state)} keys)")
 
 
 # ============================================================
@@ -383,25 +410,34 @@ def _build_loaders(cfg: Config, ds, val_ds, collator, stage_idx: int,
     safe_min = min(int(ds.total_lines * min_ratio), safe_max) if min_ratio > 0 else 0
 
     if template_only:
-        sampler = BalancedSampler(
-            ds, target_ratio=0.5, seed=cfg.seed,
-            max_samples=cfg.template_max_samples, min_samples=None,
-            max_oversample_factor=cfg.sampler_max_oversample,
-            min_minority_for_balance=10,
-            valid_range=(safe_min, safe_max),
-            use_oversampling=True, cache_dir=None)
+        target_ratio = 0.5
+        max_samples  = cfg.template_max_samples
+        use_over     = True
+        min_minority = 10
+        cache_dir    = None
     else:
-        sampler = BalancedSampler(
-            ds, target_ratio=cfg.target_ratio, seed=cfg.seed,
-            max_samples=cfg.max_samples, min_samples=cfg.min_samples,
-            max_oversample_factor=cfg.sampler_max_oversample,
-            min_minority_for_balance=cfg.sampler_min_minority,
-            valid_range=(safe_min, safe_max),
-            use_oversampling=cfg.use_oversampling,
-            cache_dir=cfg.cache_dir if cfg.use_cache else None)
+        target_ratio = cfg.target_ratio
+        max_samples  = cfg.max_samples
+        use_over     = cfg.use_oversampling
+        min_minority = cfg.sampler_min_minority
+        cache_dir    = cfg.cache_dir if cfg.use_cache else None
 
-    print(f"[loaders] stage{stage_idx} ratio={ratio} "
-          f"safe=[{safe_min},{safe_max}) sampler_len={len(sampler)}"
+    sampler = BalancedSampler(
+        ds,
+        target_ratio=target_ratio,
+        max_samples=max_samples,
+        min_samples=None,                       # avoid overshoot of minority
+        seed=cfg.seed,
+        max_oversample_factor=cfg.sampler_max_oversample,
+        min_minority_for_balance=min_minority,
+        valid_range=(safe_min, safe_max),
+        use_oversampling=use_over,
+        cache_dir=cache_dir,
+    )
+
+    print(f"[loaders] stage{stage_idx} range=[{safe_min},{safe_max}) "
+          f"target_ratio={target_ratio} sampler_len={len(sampler)} "
+          f"minority={getattr(sampler, 'minority_count', '?')}"
           f"{' (template)' if template_only else ''}"
           f"{' (no val)' if not need_val else ''}")
 
@@ -471,8 +507,8 @@ def test_dataloader(cfg: Config, n_windows: int = 3):
     train_limit = int(ds.total_lines * cfg.train_ratio)
     safe_max = max(0, min(train_limit, val_ds.start_line - cfg.win_size))
     sampler = BalancedSampler(
-        ds, target_ratio=cfg.target_ratio, seed=cfg.seed,
-        max_samples=cfg.max_samples, min_samples=cfg.min_samples,
+        ds, target_ratio=cfg.target_ratio, max_samples=cfg.max_samples,
+        min_samples=None, seed=cfg.seed,
         max_oversample_factor=cfg.sampler_max_oversample,
         min_minority_for_balance=cfg.sampler_min_minority,
         valid_range=(0, safe_max),
@@ -493,7 +529,7 @@ def test_dataloader(cfg: Config, n_windows: int = 3):
 
 
 # ============================================================
-# Eval
+# Eval (softmax over 2-class logits from lm_head)
 # ============================================================
 
 @torch.no_grad()
@@ -505,9 +541,9 @@ def evaluate(model, loader, device, max_windows=None, desc="eval"):
     for batch in pbar:
         if batch is None:
             continue
-        logits = model(batch)
-        probs.append(torch.sigmoid(logits.float()).cpu())
-        ys.append(batch["labels"].cpu())
+        logits = model(batch)                                  # [B, 2]
+        probs.append(torch.softmax(logits.float(), dim=-1)[:, 1].cpu())
+        ys.append(batch["labels"].long().cpu())
         n_seen += ys[-1].numel()
         pbar.set_postfix({"n": n_seen})
         if max_windows is not None and n_seen >= max_windows:
@@ -523,7 +559,7 @@ def evaluate(model, loader, device, max_windows=None, desc="eval"):
 
 
 # ============================================================
-# Train one stage
+# Train one stage (CE loss for decoder-style)
 # ============================================================
 
 def train_one_stage(model, train_loader, val_loader, cfg, device,
@@ -543,19 +579,18 @@ def train_one_stage(model, train_loader, val_loader, cfg, device,
     for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
-        if p.dim() <= 1:  # bias, LayerNorm weight/bias
-            no_decay.append(p)
-        elif "LayerNorm" in name or "layer_norm" in name.lower() or "layernorm" in name.lower() or "bias" in name.lower():
+        if p.dim() <= 1:
             no_decay.append(p)
         else:
             decay.append(p)
 
-    optimizer = torch.optim.AdamW([{'params':decay, 'weight_decay': cfg.weight_decay, 'lr':lr},  # для весов
-        {'params': no_decay, 'weight_decay': 0.0, 'lr':lr}  # для смещений
+    optimizer = torch.optim.AdamW([
+        {'params': decay,    'weight_decay': cfg.weight_decay, 'lr': lr},
+        {'params': no_decay, 'weight_decay': 0.0,              'lr': lr},
     ])
 
     accum = max(1, cfg.grad_accum_steps)
-    steps_per_epoch = max(1, math.ceil(len(train_loader) / accum))   # fix 1
+    steps_per_epoch = max(1, math.ceil(len(train_loader) / accum))
     total_steps = steps_per_epoch * n_epochs
     scheduler = _build_scheduler(optimizer, total_steps, cfg, max_lr=lr)
 
@@ -572,7 +607,7 @@ def train_one_stage(model, train_loader, val_loader, cfg, device,
         except Exception as e:
             print(f"[{stage_name}] scheduler state load failed: {e}")
 
-    criterion = nn.BCEWithLogitsLoss()
+    criterion = nn.CrossEntropyLoss()
     global_step = start_step
     stage_num = _STAGE_ORDER.index(stage_name) + 1
     do_eval = (stage_num not in cfg.skip_eval_stages) and (val_loader is not None)
@@ -587,8 +622,9 @@ def train_one_stage(model, train_loader, val_loader, cfg, device,
         for step_idx, batch in enumerate(pbar, 1):
             if batch is None:
                 continue
-            logits = model(batch)
-            loss = criterion(logits, batch["labels"].to(device))
+            logits = model(batch)                                  # [B, 2]
+            labels = batch["labels"].to(device).long()             # [B]
+            loss = criterion(logits, labels)
             if torch.isnan(loss) or torch.isinf(loss):
                 optimizer.zero_grad(set_to_none=True)
                 continue
@@ -601,7 +637,7 @@ def train_one_stage(model, train_loader, val_loader, cfg, device,
             if acc_count % accum == 0 or is_last:
                 if cfg.grad_clip:
                     torch.nn.utils.clip_grad_norm_(trainable, cfg.grad_clip)
-                optimizer.step();
+                optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
@@ -610,7 +646,6 @@ def train_one_stage(model, train_loader, val_loader, cfg, device,
             pbar.set_postfix({"loss": f"{running / n_b:.4f}",
                               "lr": f"{scheduler.get_last_lr()[0]:.2e}"})
 
-        # ---- eval (skippable per stage) ----
         if not do_eval:
             print(f"[{stage_name} e{epoch}] loss={running / max(n_b, 1):.4f} "
                   f"(eval skipped) elapsed={time.time() - t0:.0f}s")
@@ -641,7 +676,7 @@ def train_one_stage(model, train_loader, val_loader, cfg, device,
             folder_path=stage_dir, repo_id=cfg.hub_repo_id,
             path_in_repo=f"{cfg.run_tag}/{stage_name}",
             repo_type="model")
-        print(f"[hf] uploaded {stage_name} → {cfg.hub_repo_id}")
+        print(f"[hf] uploaded {stage_name} -> {cfg.hub_repo_id}")
 
     return start_epoch + n_epochs, global_step
 
@@ -653,7 +688,7 @@ def train_one_stage(model, train_loader, val_loader, cfg, device,
 def run(cfg: Config):
     random.seed(cfg.seed); np.random.seed(cfg.seed)
     torch.manual_seed(cfg.seed)
-    # torch.cuda.manual_seed_all(cfg.seed)
+    torch.cuda.manual_seed_all(cfg.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[env] device={device}")
@@ -676,15 +711,13 @@ def run(cfg: Config):
     model = LogLLM(cfg, device)
     collator = LogLLMCollator(model.encoder_tokenizer, cfg.max_content_len)
 
-    has_template = (cfg.use_shared_template
-                    and _template_exists(template_repo))
+    has_template = (cfg.use_shared_template and _template_exists(template_repo))
     if has_template:
-        print(f"[template] FOUND at {template_repo} → load, skip stage1")
+        print(f"[template] FOUND at {template_repo} -> load, skip stage1")
         _load_llama_template(model, template_repo)
     else:
-        print(f"[template] NOT FOUND → will train stage1 and push")
+        print(f"[template] NOT FOUND -> will train stage1 and push")
 
-    # ---- stage1 (only if template missing) ----
     if not has_template:
         print(f"\n{'*' * 20} stage1 (llama) {'*' * 20}")
         model.set_train_mode("llama")
@@ -701,7 +734,6 @@ def run(cfg: Config):
         except Exception as e:
             print(f"[template] push failed: {e}")
 
-    # ---- stages 2-4 ----
     for idx, name in zip([2, 3, 4], ["stage2", "stage3", "stage4"]):
         print(f"\n{'*' * 20} {name} ({_STAGE_MODE[name]}) {'*' * 20}")
         model.set_train_mode(_STAGE_MODE[name])
@@ -714,18 +746,16 @@ def run(cfg: Config):
                         stage_name=name, save_dir=save_dir)
         torch.cuda.empty_cache()
 
-    print(f"\n[done] checkpoints → {save_dir}")
+    print(f"\n[done] checkpoints -> {save_dir}")
     return {"model": model, "dataset": ds, "val_dataset": val_ds,
             "cfg": cfg, "device": device, "save_dir": save_dir}
 
 
 # ============================================================
-# run_many() — несколько конфигов подряд (sequential)
+# run_many()
 # ============================================================
 
 def run_many(configs: typing.Sequence[Config]):
-    """Прогоняет run(cfg) для каждой конфигурации. Первый обучит template,
-    остальные его загрузят."""
     results = {}
     for i, cfg in enumerate(configs):
         key = f"{cfg.dataset}__{cfg.encoder}"
@@ -757,8 +787,7 @@ def _resolve_resume_path(cfg: Config) -> str:
 
 def continue_learning(cfg: Config):
     random.seed(cfg.seed); np.random.seed(cfg.seed)
-    torch.manual_seed(cfg.seed)
-    # torch.cuda.manual_seed_all(cfg.seed)
+    torch.manual_seed(cfg.seed); torch.cuda.manual_seed_all(cfg.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[env] device={device}")
@@ -776,13 +805,12 @@ def continue_learning(cfg: Config):
     if cfg.resume_next_stage:
         idx = _STAGE_ORDER.index(cfg.resume_from_stage)
         if idx + 1 >= len(_STAGE_ORDER):
-            print(f"[resume] last stage — nothing to do")
+            print(f"[resume] last stage -> nothing to do")
             return None
         target = _STAGE_ORDER[idx + 1]
         start_epoch, start_step = 0, 0
         optimizer_state = scheduler_state = None
-        print(f"[resume] {cfg.resume_from_stage} → {target} "
-              f"(fresh optimizer)")
+        print(f"[resume] {cfg.resume_from_stage} -> {target} (fresh optimizer)")
     else:
         target = cfg.resume_from_stage
         start_epoch = int(state.get("epoch", 0))
@@ -823,7 +851,7 @@ def continue_learning(cfg: Config):
         start_epoch=start_epoch, start_step=start_step,
         optimizer_state=optimizer_state, scheduler_state=scheduler_state)
     print(f"\n[done] epoch={end_epoch} step={end_step} "
-          f"checkpoints → {save_dir}")
+          f"checkpoints -> {save_dir}")
     return {"model": model, "dataset": ds, "val_dataset": val_ds,
             "cfg": cfg, "device": device, "save_dir": save_dir}
 
@@ -836,12 +864,10 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", default="train",
-                        choices=["train", "continue", "test_preproc",
-                                 "test_loader"])
+                        choices=["train", "continue", "test_preproc", "test_loader"])
     parser.add_argument("--dataset", default="liberty",
                         choices=list(_DATASET_CLS.keys()))
-    parser.add_argument("--encoder", default="bert-base",
-                        help=f"preset name or hf path. presets: {list(ENCODER_PRESETS)}")
+    parser.add_argument("--encoder", default="bert-base")
     parser.add_argument("--llama", default="meta-llama/Meta-Llama-3-8B")
     parser.add_argument("--preprocess", default=None,
                         choices=["none", "normalize", "replace", "both"])
@@ -852,8 +878,7 @@ if __name__ == "__main__":
     parser.add_argument("--n", type=int, default=10)
     parser.add_argument("--resume-from", default=None)
     parser.add_argument("--resume-subdir", default=None)
-    parser.add_argument("--resume-stage", default="stage4",
-                        choices=_STAGE_ORDER)
+    parser.add_argument("--resume-stage", default="stage4", choices=_STAGE_ORDER)
     parser.add_argument("--resume-next", action="store_true")
     parser.add_argument("--resume-epochs", type=int, default=None)
     args = parser.parse_args()
