@@ -5,7 +5,7 @@ LogLLM: encoder-agnostic (BERT / RoBERTa / DeBERTa-v3 / Longformer / BigBird)
 import os
 import math
 import typing
-
+import bitsandbytes as bnb
 import torch
 import torch.nn as nn
 
