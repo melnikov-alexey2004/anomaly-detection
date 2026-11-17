@@ -255,7 +255,9 @@ class LogLLM(nn.Module):
                 enc_spec["path"], config=enc_cfg,
                 quantization_config=enc_bnb,
                 device_map=device) # low_cpu_mem_usage=True,  ???
-            self.encoder = prepare_model_for_kbit_training(self.encoder)
+            self.encoder = prepare_model_for_kbit_training(self.encoder, use_gradient_checkpointing=False)
+            self.encoder.gradient_checkpointing_enable(
+                gradient_checkpointing_kwargs={"use_reentrant": False})
         else:
             self.encoder = AutoModel.from_pretrained(
                 enc_spec["path"], config=enc_cfg,
@@ -299,6 +301,9 @@ class LogLLM(nn.Module):
             config.llama_path, quantization_config=llama_bnb,
             low_cpu_mem_usage=True, device_map=device)
         self.llama = prepare_model_for_kbit_training(self.llama)
+        self.llama.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False})
+
         self.llama = get_peft_model(self.llama, LoraConfig(
             r=config.llama_lora_r, lora_alpha=config.llama_lora_alpha,
             lora_dropout=config.decoder_lora_dropout,
@@ -411,10 +416,21 @@ class LogLLM(nn.Module):
             mask[b, :n] = 1
 
         out = self.llama(inputs_embeds=padded, attention_mask=mask,
-                         output_hidden_states=True)
-        hidden = out.hidden_states[-1]
-        last_idx = mask.sum(dim=1) - 1
-        last_hidden = hidden[torch.arange(B, device=self.device), last_idx]
+                         output_hidden_states=False)
+        # hidden = out.hidden_states[-1]
+        hidden = out.last_hidden_state
+
+        if self.cfg.decoder_head_pooling == "last":
+
+            if self.cfg.decoder_tokenizer_padding_side == "left":
+                last_idx = torch.full((B,), max_len-1, device=mask.device)
+            else:
+                last_idx = mask.sum(dim=1) - 1
+
+            last_hidden = hidden[torch.arange(B, device=self.device), last_idx]
+        elif self.cfg.decoder_head_pooling == "mean":
+            # bs, sl, hs x  bs, sl, 1
+            last_hidden = (hidden * mask.unsqueeze(-1)).sum(1) / mask.sum(1, keepdim=True)
         return self.classifier(last_hidden.float()).squeeze(-1)
 
     # ---------- Train modes ----------

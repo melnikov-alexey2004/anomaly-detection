@@ -99,6 +99,7 @@ class Config:
     decoder_tokenizer_padding_side: Optional[Literal['right', 'left']] = None
     decoder_target_modules: list[str] = dataclasses.field(
         default_factory=lambda: ["q_proj", "k_proj", "v_proj", "o_proj"])
+    decoder_head_pooling: Union[str, Literal["last", "mean"]] = "last"
 
     # ---- compute dtype ----
     compute_dtype: str = "bf16"         # "bf16"|"fp16"|"fp32"|"tf32"
@@ -581,7 +582,7 @@ def train_one_stage(model, train_loader, val_loader, cfg, device,
         epoch = start_epoch + epoch_offset
         model.train()
         running, n_b, acc_count = 0.0, 0, 0
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none=True)
         t0 = time.time()
         pbar = tqdm.tqdm(train_loader, desc=f"{stage_name} e{epoch}")
         for batch in pbar:
@@ -601,7 +602,7 @@ def train_one_stage(model, train_loader, val_loader, cfg, device,
                     torch.nn.utils.clip_grad_norm_(trainable, cfg.grad_clip)
                 optimizer.step()
                 scheduler.step()
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 global_step += 1
             pbar.set_postfix({"loss": f"{running / n_b:.4f}",
                               "lr": f"{scheduler.get_last_lr()[0]:.2e}"})
