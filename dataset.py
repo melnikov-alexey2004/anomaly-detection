@@ -13,7 +13,7 @@ import math
 import hashlib
 import pickle
 import tempfile
-
+from typing import Optional
 
 # ============================================================
 # Хелперы для кэша
