@@ -327,7 +327,7 @@ class LogLLM(nn.Module):
         # ---------- Head ----------
         self.classifier = nn.Sequential(
             nn.Linear(self.llama_dim, 256),
-            nn.ReLU(), nn.Dropout(0.2), nn.Linear(256, 1),
+            nn.GELU(), nn.Dropout(0.1), nn.Linear(256, 1),
         ).to(device)
 
         self.ins1_str = "Below is a sequence of system log messages:"

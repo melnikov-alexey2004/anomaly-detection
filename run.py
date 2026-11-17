@@ -648,7 +648,8 @@ def train_one_stage(model, train_loader, val_loader, cfg, device,
 
 def run(cfg: Config):
     random.seed(cfg.seed); np.random.seed(cfg.seed)
-    torch.manual_seed(cfg.seed); torch.cuda.manual_seed_all(cfg.seed)
+    torch.manual_seed(cfg.seed)
+    # torch.cuda.manual_seed_all(cfg.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[env] device={device}")
