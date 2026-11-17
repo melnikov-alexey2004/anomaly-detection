@@ -55,8 +55,8 @@ class Config:
     step_size: int = 100
     anchor_step: int = 10
     batch_size: int = 4
-    stage_batch_sizes: typing.Optional[typing.Dict[int, int]] = None
-    stage_batch_sizes_on_evaluation: typing.Optional[typing.Dict[int, int]] = None
+    stage_batch_sizes: typing.Optional[typing.Dict[int, int]] = dataclasses.field(default_factory=dict)
+    stage_batch_sizes_on_evaluation: typing.Optional[typing.Dict[int, int]] = dataclasses.field(default_factory=dict)
     num_workers: int = 4
     use_in_colab: bool = True
     max_lines: typing.Optional[int] = None

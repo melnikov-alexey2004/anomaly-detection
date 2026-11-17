@@ -318,7 +318,8 @@ class LogLLM(nn.Module):
             self.encoder = AutoModel.from_pretrained(
                 enc_spec["path"], config=enc_cfg,
                 quantization_config=enc_bnb,
-                device_map=device)
+                torch_dtype=self.compute_dtype,
+                device_map=str(device))
             self.encoder = prepare_model_for_kbit_training(
                 self.encoder, use_gradient_checkpointing=False)
             self.encoder.gradient_checkpointing_enable(
@@ -355,6 +356,10 @@ class LogLLM(nn.Module):
             r=config.encoder_lora_r, lora_alpha=config.encoder_lora_alpha,
             lora_dropout=0.01, target_modules=lora_targets))
 
+        _inner = getattr(getattr(self.encoder, "base_model", None), "model", None)
+        print(f"[encoder] gc (after PEFT): "
+              f"{getattr(_inner, 'gradient_checkpointing', None)}")
+
         # ---------- Decoder QLoRA ----------
         llama_bnb = BitsAndBytesConfig(
             load_in_4bit=True, bnb_4bit_use_double_quant=True,
@@ -381,19 +386,14 @@ class LogLLM(nn.Module):
             target_modules=config.decoder_target_modules,
             bias="none", task_type=TaskType.CAUSAL_LM))
 
-        # Sanitize dtype of non-quantized Linear / Conv1d
         n_cast = 0
-        for name, module in self.llama.named_modules():
+        for name, module in self.encoder.named_modules():
             if isinstance(module, nn.Linear) and not isinstance(module, bnb.nn.Linear4bit):
                 if module.weight.dtype != self.compute_dtype:
                     module.to(self.compute_dtype)
                     n_cast += 1
-            elif isinstance(module, nn.Conv1d):
-                if module.weight.dtype != self.compute_dtype:
-                    module.to(self.compute_dtype)
-                    n_cast += 1
         if n_cast:
-            print(f"[decoder] cast {n_cast} modules to {self.compute_dtype}")
+            print(f"[encoder] cast {n_cast} modules to {self.compute_dtype}")
 
         # ---------- Universal decoder components ----------
         self._text_transformer = _get_text_transformer(self.llama)
