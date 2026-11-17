@@ -96,10 +96,9 @@ class Config:
     llama_lora_r: int = 16
     llama_lora_alpha: int = 32
     decoder_lora_dropout: float = 0.1
-    decoder_tokenizer_padding_side: Optional[Literal['right', 'left']] = None
     decoder_target_modules: list[str] = dataclasses.field(
         default_factory=lambda: ["q_proj", "k_proj", "v_proj", "o_proj"])
-    decoder_head_pooling: Union[str, Literal["last", "mean"]] = "last"
+    decoder_head_pooling: Literal["last", "mean"] = "last"
 
     # ---- compute dtype ----
     compute_dtype: str = "bf16"         # "bf16"|"fp16"|"fp32"|"tf32"

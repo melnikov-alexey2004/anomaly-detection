@@ -295,7 +295,7 @@ class LogLLM(nn.Module):
             bnb_4bit_quant_type="nf4",
             bnb_4bit_compute_dtype=self.compute_dtype)
         self.llama_tokenizer = AutoTokenizer.from_pretrained(
-            config.llama_path, padding_side=config.decoder_tokenizer_padding_side)
+            config.llama_path)
         self.llama_tokenizer.pad_token = self.llama_tokenizer.eos_token
         self.llama = AutoModelForCausalLM.from_pretrained(
             config.llama_path, quantization_config=llama_bnb,
@@ -422,11 +422,7 @@ class LogLLM(nn.Module):
 
         if self.cfg.decoder_head_pooling == "last":
 
-            if self.cfg.decoder_tokenizer_padding_side == "left":
-                last_idx = torch.full((B,), max_len-1, device=mask.device)
-            else:
-                last_idx = mask.sum(dim=1) - 1
-
+            last_idx = mask.sum(dim=1) - 1
             last_hidden = hidden[torch.arange(B, device=self.device), last_idx] # hidden.device #todo:
         elif self.cfg.decoder_head_pooling == "mean":
             # bs, sl, hs x  bs, sl, 1
