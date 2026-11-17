@@ -429,12 +429,13 @@ class LogLLM(nn.Module):
         # out = self.llama(inputs_embeds=padded, attention_mask=mask,
         #                  output_hidden_states=False)
         # hidden = out.hidden_states[-1]
-        base_lm = self.llama.get_base_model()  # PeftModel -> Qwen3ForCausalLM
-        transformer = base_lm.model  # Qwen3ForCausalLM -> Qwen3Model
+        #QWEN3.5 only
+        base_lm = self.llama.get_base_model()  # Qwen3_5ForCausalLM
+        multimodal = base_lm.model  # Qwen3_5Model (visual + language_model)
+        transformer = multimodal.language_model  # Qwen3_5TextModel
 
-        out = transformer(inputs_embeds=padded, attention_mask=mask,
-                          use_cache=False)
-        hidden = out.last_hidden_state  # [B, max_len, llama_dim]
+        out = transformer(inputs_embeds=padded, attention_mask=mask, use_cache=False)
+        hidden = out.last_hidden_state
 
         if self.cfg.decoder_head_pooling == "last":
 
