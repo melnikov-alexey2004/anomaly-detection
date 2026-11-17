@@ -606,7 +606,6 @@ class BalancedSampler(Sampler):
         min_minority_for_balance: int = 50,
         seed: int = 42,
         use_oversampling: bool = True,
-        cache_dir: Optional[str] = None,
     ):
         assert 0.0 < target_ratio < 1.0
         assert max_oversample_factor >= 1.0

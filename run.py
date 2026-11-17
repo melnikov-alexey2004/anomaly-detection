@@ -426,13 +426,12 @@ def _build_loaders(cfg: Config, ds, val_ds, collator, stage_idx: int,
         ds,
         target_ratio=target_ratio,
         max_samples=max_samples,
-        min_samples=None,                       # avoid overshoot of minority
         seed=cfg.seed,
         max_oversample_factor=cfg.sampler_max_oversample,
         min_minority_for_balance=min_minority,
         valid_range=(safe_min, safe_max),
         use_oversampling=use_over,
-        cache_dir=cache_dir,
+        # cache_dir=cache_dir,
     )
 
     print(f"[loaders] stage{stage_idx} range=[{safe_min},{safe_max}) "
@@ -508,11 +507,13 @@ def test_dataloader(cfg: Config, n_windows: int = 3):
     safe_max = max(0, min(train_limit, val_ds.start_line - cfg.win_size))
     sampler = BalancedSampler(
         ds, target_ratio=cfg.target_ratio, max_samples=cfg.max_samples,
-        min_samples=None, seed=cfg.seed,
+        seed=cfg.seed,
         max_oversample_factor=cfg.sampler_max_oversample,
         min_minority_for_balance=cfg.sampler_min_minority,
         valid_range=(0, safe_max),
-        use_oversampling=cfg.use_oversampling, cache_dir=None)
+        use_oversampling=cfg.use_oversampling,
+        # cache_dir=None
+    )
 
     print(f"\n{'='*90}\nDataloader test | train_ratio={cfg.train_ratio} | "
           f"safe_max={safe_max} | sampler_total={len(sampler)}\n{'='*90}\n")
