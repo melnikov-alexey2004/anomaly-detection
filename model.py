@@ -426,10 +426,15 @@ class LogLLM(nn.Module):
             padded[b, :n] = s
             mask[b, :n] = 1
 
-        out = self.llama(inputs_embeds=padded, attention_mask=mask,
-                         output_hidden_states=False)
+        # out = self.llama(inputs_embeds=padded, attention_mask=mask,
+        #                  output_hidden_states=False)
         # hidden = out.hidden_states[-1]
-        hidden = out.last_hidden_state
+        base_lm = self.llama.get_base_model()  # PeftModel -> Qwen3ForCausalLM
+        transformer = base_lm.model  # Qwen3ForCausalLM -> Qwen3Model
+
+        out = transformer(inputs_embeds=padded, attention_mask=mask,
+                          use_cache=False)
+        hidden = out.last_hidden_state  # [B, max_len, llama_dim]
 
         if self.cfg.decoder_head_pooling == "last":
 
@@ -439,6 +444,8 @@ class LogLLM(nn.Module):
             # bs, sl, hs x  bs, sl, 1
             m = mask.unsqueeze(-1).to(hidden.dtype)
             last_hidden = (hidden * m).sum(1) / m.sum(1).clamp_min(1.0)
+
+
         return self.classifier(last_hidden.float()).squeeze(-1)
 
     # ---------- Train modes ----------
