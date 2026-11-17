@@ -450,7 +450,7 @@ def _build_loaders(cfg: Config, ds, val_ds, collator, stage_idx: int,
           f"{' (no val)' if not need_val else ''}")
 
     bs = cfg.stage_batch_sizes.get(stage_idx, cfg.batch_size)
-    eval_bs = cfg.stage_batch_sizes_on_evaluation.get(stage_idx, cfg.batch_size)
+    eval_bs = cfg.stage_batch_sizes_on_evaluation.get(stage_idx, None) or bs
 
     train_loader = DataLoader(
         ds, batch_size=bs, sampler=sampler,
