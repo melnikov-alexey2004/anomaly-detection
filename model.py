@@ -298,7 +298,7 @@ class LogLLM(nn.Module):
             config.llama_path)
         self.llama_tokenizer.pad_token = self.llama_tokenizer.eos_token
         self.llama = AutoModelForCausalLM.from_pretrained(
-            config.llama_path, quantization_config=llama_bnb,
+            config.llama_path, quantization_config=llama_bnb, torch_dtype=self.compute_dtype,
             low_cpu_mem_usage=True, device_map=device)
         self.llama = prepare_model_for_kbit_training(self.llama, use_gradient_checkpointing=False)
         self.llama.gradient_checkpointing_enable(
@@ -309,6 +309,17 @@ class LogLLM(nn.Module):
             lora_dropout=config.decoder_lora_dropout,
             target_modules=config.decoder_target_modules,
             bias="none", task_type=TaskType.CAUSAL_LM))
+
+        for name, module in self.llama.named_modules():
+            if isinstance(module, nn.Linear) and not isinstance(module, bnb.nn.Linear4bit):
+                if module.weight.dtype != self.compute_dtype:
+                    module.to(self.compute_dtype)
+                    print(f"[cast] {name}: fp32 -> {self.compute_dtype}")
+            elif isinstance(module, nn.Conv1d):
+                if module.weight.dtype != self.compute_dtype:
+                    module.to(self.compute_dtype)
+                    print(f"[cast] {name} (Conv1d): -> {self.compute_dtype}")
+
         self.llama_dim = self.llama.config.hidden_size
 
         # ---------- Projector ----------
